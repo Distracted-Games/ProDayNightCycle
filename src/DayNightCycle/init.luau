@@ -25,7 +25,7 @@ local isServer = RunService:IsServer()
 local isClient = RunService:IsClient()
 
 local logger = Logger.new({
-	Debug = true, -- Toggles verbose logging for this module.
+	Debug = false, -- Toggles verbose logging for this module.
 	Prefix = "DayNightCycle",
 })
 
