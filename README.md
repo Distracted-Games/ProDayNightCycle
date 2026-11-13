@@ -1,16 +1,19 @@
 # DayNightCycle
 
-A configurable, event-driven day/night cycle system for Roblox experiences. This module simulates a full 24-hour game day over a customizable real-world duration. It features a robust Client/Server architecture, ensuring smooth visual transitions on the client without flooding the network, while keeping the server synchronized for game logic.
+A configurable, event-driven day/night cycle for Roblox experiences. It runs a full 24-hour game day over a real-world duration you choose, from server start to shutdown, and gives you named time events, variable-speed phases (so the night can pass faster than the day), and per-phase lighting looks that blend smoothly.
 
-The system allows developers to easily hook into specific times of day (e.g., "Dawn", "Midnight") with dynamic, named events that fire simultaneously on both the Client and the Server.
+The server owns the clock and replicates it with attributes. Every machine derives the current time from `workspace:GetServerTimeNow()`, so there is no per-frame network traffic, late joiners are in sync the moment they start, and the Server and Clients fire time events together.
 
 ## Features
 
-- **Client/Server Optimized**: The server tracks logical time and broadcasts state changes, while clients handle visual interpolation via `Lighting:SetMinutesAfterMidnight` for zero network overhead during the cycle.
-- **Event-Driven**: Fires custom events at specific in-game hours using a high-performance `Signal` class.
-- **Dynamic Events**: Add or remove custom time-based events at runtime. Changes on the Server are automatically replicated to all Clients.
-- **Lifecycle Ready**: Integrates seamlessly with the [ModuleLoader](https://github.com/Distracted-Games/ModuleLoader) framework.
-- **Integrated Logging**: Uses the included [Logger](https://github.com/Distracted-Games/Logger) utility for clear, toggleable debug output.
+- **Server-authoritative clock**: One small state value is replicated. Everything else is calculated locally from the shared server time. No RemoteEvents.
+- **Time events**: Fire named events at specific in-game hours (e.g. "Dawn", "Midnight") on both the Server and the Clients. Add and remove them at runtime.
+- **Phases with variable speed**: Divide the day into phases (Night, Dawn, Day, Dusk by default) and give each a `TimeShare` that sets how fast it passes.
+- **Lighting looks**: Each phase can set properties on `Lighting`, `Atmosphere`, `BloomEffect`, `SunRaysEffect` and `ColorCorrectionEffect`. The lighting blends between looks as the day moves through the phases.
+- **Runtime control**: Pause, resume, jump to a time, and change the day length from the Server.
+- **HUD-friendly attributes**: `Day`, `IsPaused` and `Phase` are published as attributes on `Lighting`.
+- **Lifecycle ready**: Works with the [ModuleLoader](https://github.com/Distracted-Games/ModuleLoader) framework.
+- **Integrated logging**: Uses the included [Logger](https://github.com/Distracted-Games/Logger) utility for toggleable debug output.
 
 ## Installation
 
@@ -18,110 +21,200 @@ The easiest way to install DayNightCycle is to grab the latest `.rbxm` release.
 
 1. Download the `DayNightCycle.rbxm` file from the [Latest Release Page](https://github.com/Distracted-Games/ProDayNightCycle/releases/latest).
 2. Drag and drop the `.rbxm` file into Roblox Studio.
-3. Because this module must run on both the Client and the Server, it is highly recommended to place the contained `DayNightCycle` module into **ReplicatedStorage**.
+3. Because this module must run on both the Client and the Server, place the `DayNightCycle` module into **ReplicatedStorage**.
 
 ## Configuration
 
-The module's configuration can be modified in the `config` table at the top of the script. The default settings are:
+All configuration lives in the `Config` module inside `DayNightCycle`. It is read when the cycle starts, so edit it in Studio rather than at runtime; use the [API](#api-reference) to change things while the game runs.
+
+| Setting | Description |
+|---------|-------------|
+| `DayLengthInMinutes` | Real-world minutes for a full 24-hour game day (default `180`). |
+| `StartTimeOfDay` | The hour (0-24) to start at. `nil` uses the current `Lighting` time. |
+| `StartDay` | The value of `Day` when the cycle starts (default `1`). Each game decides what a "day" means. |
+| `TimeEvents` | A dictionary mapping event names to game hours. |
+| `Phases` | The parts of the day, with their speed and lighting. See [Phases and Lighting](#phases-and-lighting). |
+| `Lighting.Enabled` | Whether phase looks are applied to `Lighting` on Clients (default `true`). |
 
 ```lua
-local config: DayNightCycleConfig = {
-    DayLengthInMinutes = 180, -- The duration of a full 24-hour game day in real-world minutes.
-    StartTimeOfDay = nil,     -- A specific hour (0-24) to start at. `nil` uses the current `Lighting` time.
-    TimeEvents = { -- A dictionary mapping event names to game hours.
-        Dawn = 4.75, -- 4:45 AM
+const Config: Types.Config = {
+	DayLengthInMinutes = 180,
+	StartTimeOfDay = nil,
+	StartDay = 1,
+	TimeEvents = {
+		Dawn = 4.75, -- 4:45 AM
 		Sunrise = 5.75, -- 5:45 AM
 		Midday = 12.0, -- 12:00 PM
 		Sunset = 17.6, -- 5:36 PM
 		Dusk = 18.25, -- 6:15 PM
 		Midnight = 0.0, -- 12:00 AM
-    },
+	},
+	-- Phases = { ... }, Lighting = { Enabled = true },
 }
 ```
 
-> ***Note**: The default event times were synched up with the default Roblox Lighting times for those actual events. If your lighting differs, you may have to adjust these default event times.*
+> ***Note**: The default event times are synced with the default Roblox Lighting times for those events. If your lighting differs, you may have to adjust them.*
+
+Event names may only contain letters, numbers and underscores, at most 40 characters, and there can be at most 63 events. These limits come from how Roblox limits attributes.
+
+## Phases and Lighting
+
+A phase is a named part of the day. It starts at the hour of one of your time events (its `StartEvent`) and lasts until the next phase starts, wrapping past midnight. The defaults are:
+
+| Phase | Starts at event | TimeShare | Real-world time at 180 minutes |
+|-------|-----------------|-----------|--------------------------------|
+| Night | `Dusk` (18:15) | 28 | about 50 minutes |
+| Dawn | `Dawn` (4:45) | 4 | about 7 minutes |
+| Day | `Sunrise` (5:45) | 65 | about 117 minutes |
+| Dusk | `Sunset` (17:36) | 3 | about 5 minutes |
+
+```lua
+{
+	Name = "Dusk",
+	StartEvent = "Sunset",
+	TimeShare = 3,
+	BlendHours = 0.35,
+	Look = {
+		Lighting = { Brightness = 2, ColorShift_Top = Color3.fromRGB(255, 190, 125) },
+		Atmosphere = { Color = Color3.fromRGB(255, 180, 140), Haze = 2 },
+		Bloom = { Intensity = 0.15 },
+	},
+}
+```
+
+- **`TimeShare`** is the phase's relative share of the real-world day length. Only the ratios matter. If you leave it out, the phase's length in game hours is used. Leave `Phases` empty for a constant speed.
+- **`BlendHours`** is how many game hours, from the start of the phase, the lighting spends blending from the previous phase's look to this one (limited to the phase's length). The default is `0.75`. Blending follows game time, so it speeds up, slows down and pauses with the clock.
+- **`Look`** has optional `Lighting`, `Atmosphere`, `Bloom`, `SunRays` and `ColorCorrection` tables, each with optional properties (see `Types.luau` for the full list; your editor will autocomplete them). A property a phase leaves out keeps the value from the closest earlier phase that sets it. Numbers and colors blend smoothly.
+- Effects are found inside `Lighting`, or created on the Client if they are missing.
+- The server never changes `Lighting`. Set `Lighting.Enabled = false` to control the lighting yourself; phases still set the speed of time.
+- Events that start a phase belong to the phase: `AddTimeEvent` and `RemoveTimeEvent` refuse to change them.
 
 ## Usage
 
-### Using the ModuleLoader
-If you are using the [ModuleLoader](https://github.com/Distracted-Games/ModuleLoader) framework and have placed the module in `ReplicatedStorage/Source`, the loader will automatically call the `Start()` method on the Client. 
+Call `Start()` once on the Server and once on each Client.
 
-**Important Note:** If you placed the module in `ReplicatedStorage`, the ModuleLoader will not automatically start it on the Server. You must manually call `DayNightCycle.Start()` from your `ServerStart` script after all modules have finished their Setup phase:
+### Using the ModuleLoader
+If you are using the [ModuleLoader](https://github.com/Distracted-Games/ModuleLoader) framework and have placed the module in `ReplicatedStorage/Source`, the loader will automatically call `Start()` on the Client.
+
+**Important Note:** If you placed the module in `ReplicatedStorage`, the ModuleLoader will not automatically start it on the Server. Call `DayNightCycle.Start()` from your `ServerStart` script after all modules have finished their Setup phase:
 
 ```lua
 -- Inside your ServerStart script:
-local DayNightCycle = require(ReplicatedStorage.DayNightCycle)
+const DayNightCycle = require(ReplicatedStorage.DayNightCycle)
 DayNightCycle.Start()
 ```
 
-Similarly, if you did not place the module in a `Source` folder within `ReplicatedStorage`, you will manually have to call `Start()` ont he client as well, similar to the standalone instructions below.
+If you did not place the module in a `Source` folder within `ReplicatedStorage`, call `Start()` on the Client yourself, as below.
 
 ### Standalone Usage
-If you are not using my `ModuleLoader` framework at all, you can start the cycle manually by calling `Start()` on both the Client and the Server. The Client will automatically request a time sync from the Server.
-
 **Server Script:**
 ```lua
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local DayNightCycle = require(ReplicatedStorage.DayNightCycle)
+const ReplicatedStorage = game:GetService("ReplicatedStorage")
+const DayNightCycle = require(ReplicatedStorage.DayNightCycle)
 
 DayNightCycle.Start()
 ```
 
 **Local Script:**
 ```lua
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local DayNightCycle = require(ReplicatedStorage:WaitForChild("DayNightCycle"))
+const ReplicatedStorage = game:GetService("ReplicatedStorage")
+const DayNightCycle = require(ReplicatedStorage:WaitForChild("DayNightCycle"))
 
--- The client will ask the server for the current time and begin interpolating
-DayNightCycle.Start() 
+-- The Client follows the Server's clock, including when joining mid-cycle.
+DayNightCycle.Start()
 ```
 
-### Adding Custom Time Events dynamically
-You can add or modify events at runtime. If called from the Server, the event will automatically replicate to all Clients.
+### Listening for Events
+Connect to `DayNightCycle.TimeEvent` from any script, on the Server or a Client. Events fire when the clock crosses their hour.
+
+```lua
+const DayNightCycle = require(ReplicatedStorage.DayNightCycle)
+
+DayNightCycle.TimeEvent:Connect(function(eventName: string, eventHour: number)
+	if eventName == "Dusk" then
+		print("The sun has set! Spawning night monsters...")
+	elseif eventName == "Dawn" then
+		print("The sun is rising! Despawning monsters...")
+	end
+end)
+
+DayNightCycle.PhaseChanged:Connect(function(newPhase: string, previousPhase: string)
+	print(`{previousPhase} -> {newPhase}`)
+end)
+```
+
+### Adding Time Events at Runtime
+From the Server, events replicate to all Clients automatically.
 
 ```lua
 DayNightCycle.AddTimeEvent("EveningRush", 17.5) -- Fires at 5:30 PM
 ```
 
-### Listening for Events
-The module utilizes a custom `Signal` class for high-performance event dispatching. You can connect to `DayNightCycle.TimeEvent` from any script.
-
-**Example: A server script spawning monsters at night.**
+### Controlling Time (Server)
 ```lua
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local DayNightCycle = require(ReplicatedStorage.DayNightCycle)
+DayNightCycle.Pause()
+DayNightCycle.Resume()
+DayNightCycle.SetTime(5.7) -- Jump to 5:42 AM on the current day, silently.
+DayNightCycle.SetTime(5.7, true) -- Same, but fire the events passed on the way.
+DayNightCycle.SetDayLength(30) -- A day now lasts 30 real-world minutes.
+```
 
-local function onTimeChanged(eventName: string, eventHour: number)
-    if eventName == "Dusk" then
-        print("The sun has set! Spawning night monsters...")
-    elseif eventName == "Dawn" then
-        print("The sun is rising! Despawning monsters...")
-    end
-end
+### Reading Public State (HUDs)
+`Day`, `IsPaused` and `Phase` are attributes on `Lighting`, so a HUD can read them without requiring the module. Use `DayNightCycle.AttributeNames` for the names:
 
--- Connect to the signal
-DayNightCycle.TimeEvent:Connect(onTimeChanged)
+```lua
+const Lighting = game:GetService("Lighting")
+const names = DayNightCycle.AttributeNames
+
+Lighting:GetAttributeChangedSignal(names.Day):Connect(function()
+	print("Day", Lighting:GetAttribute(names.Day))
+end)
 ```
 
 ## API Reference
 
-| Method                        | Description                                                                 |
-|-------------------------------|-----------------------------------------------------------------------------|
-| `StartCycle()`                | Begins the day/night cycle. Called automatically if using `Start()`.        |
-| `StopCycle()`                 | Stops the cycle and disconnects updates.                                    |
-| `AddTimeEvent(name, hour)`    | Adds or updates a named time event. Replicates to clients if on the server. |
-| `RemoveTimeEvent(name)` | Removes a named time event. Replicates to clients if on the server.         |
-| `GetCurrentTime()`            | Returns the current in-game time (0–24) as a number. Slightly different than using Lighting.                        |
-| `Start()`                     | Lifecycle method for ModuleLoader integration or initial sync.              |
+Server-only functions called from a Client log a warning and do nothing.
 
-### Public Properties
-`DayNightCycle.TimeEvent: Signal`  
-The signal that fires when a configured time is reached. It passes two arguments to connected callbacks: `eventName: string` and `eventHour: number`.
+| Method | Description |
+|--------|-------------|
+| `Start()` | Starts the cycle on the Server, or begins following the Server's clock on a Client. Call once on each. |
+| `AddTimeEvent(name, hour)` | **[Server]** Adds or updates a named time event. Replicates to Clients. |
+| `RemoveTimeEvent(name): boolean` | **[Server]** Removes a named time event. Returns whether it existed. |
+| `Pause()` | **[Server]** Freezes game time. Events do not fire while paused. |
+| `Resume()` | **[Server]** Resumes game time where it paused. |
+| `SetTime(hour, fireSkippedEvents?)` | **[Server]** Jumps to an hour on the current day. `Day` is unchanged. Events passed on the way fire in order only if `fireSkippedEvents` is true. |
+| `SetDayLength(minutes)` | **[Server]** Changes the real-world minutes per game day, keeping the current time. |
+| `GetCurrentTime(): number` | The current in-game time (0-24). |
+| `GetDay(): number` | The current day number. It increases each midnight. |
+| `GetPhase(): string?` | The current phase name, or `nil` if no phases are configured. |
+| `IsPaused(): boolean` | Whether game time is paused. |
+
+| Property | Description |
+|----------|-------------|
+| `TimeEvent` | Signal fired when an event's hour is reached. Passes `eventName: string` and `eventHour: number`. |
+| `PhaseChanged` | Signal fired when the day moves into a new phase, including after `SetTime`. Passes `newPhase: string` and `previousPhase: string`. |
+| `AttributeNames` | The names of the attributes published on `Lighting`: `Day`, `IsPaused` and `Phase`. |
+
+## Upgrading from 3.x
+
+- `StartCycle()` and `StopCycle()` are removed. The cycle runs from `Start()` to shutdown; use `Pause()` and `Resume()` to stop time.
+- Configuration moved from the top of the script to `Config.luau`.
+- **Clients must call `Start()`.** They no longer start from a Server broadcast.
+- The RemoteEvents are gone. State replicates with attributes, and a Client can no longer request a sync.
+- Time events fire from the clock instead of per-event flags, and event names are limited to letters, numbers and underscores.
+- New: phases, lighting looks, `Pause`, `Resume`, `SetTime`, `SetDayLength`, `GetDay`, `GetPhase`, `IsPaused` and `PhaseChanged`.
 
 ## Performance Notes
-- Visual time interpolation is handled entirely on the Client via `RunService.Heartbeat`.
-- The Server tracks logical time without polling or flooding network queues with `Lighting` property changes.
-- Late-joining clients automatically request a sync, ensuring seamless time transitions for all players.
+- The Server only replicates when the clock changes (start, pause, resume, `SetTime`, `SetDayLength`) or an event is added or removed. Time passing costs no network traffic.
+- Each Client applies the time to `Lighting` every frame, and blends the looks 12 times per second, and only when the blend changes.
+- Late-joining Clients receive the current state automatically with the instance.
 
 ## Debugging
-Verbose logging can be enabled by setting `Debug = true` in the Logger configuration inside the module. This will print detailed output regarding time progression, synchronization, and event triggers.
+Verbose logging can be enabled by setting `Debug = true` where the module creates its `Logger` in `init.luau`. This prints detailed output about time events, phase changes and re-syncs.
+
+## Development
+The pure modules (clock, timeline, events, look blending) are tested outside of Studio with the standalone [Luau](https://github.com/luau-lang/luau) CLI:
+
+```
+luau tests/run.luau
+```
