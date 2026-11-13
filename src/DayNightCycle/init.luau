@@ -80,12 +80,29 @@ local function validateConfig(config: Types.Config)
 		"Config.StartTimeOfDay must be nil or a number between 0 and 24."
 	)
 
+	local eventCount = 0
 	for eventName, eventHour in config.TimeEvents do
+		Replication.assertEventName(eventName)
 		assert(
 			eventHour >= 0 and eventHour < HOURS_PER_DAY,
 			`Config.TimeEvents.{eventName} must be a number between 0 and 23.99.`
 		)
+		eventCount += 1
 	end
+
+	assert(
+		eventCount <= Replication.MaxTimeEvents,
+		`Config.TimeEvents can have at most {Replication.MaxTimeEvents} events.`
+	)
+end
+
+local function countTimeEvents(): number
+	local eventCount = 0
+	for _ in timeEvents do
+		eventCount += 1
+	end
+
+	return eventCount
 end
 
 local function getServerTime(): number
@@ -144,11 +161,12 @@ local function reanchorClock(changes: Clock.Changes)
 		TimeEvents.forEachCrossed(timeEvents, currentHour, changes.Hour, fireTimeEvent)
 	end
 
-	clockState = newState
-	previousHour = Clock.getTime(newState, serverTime)
+	-- Use the state exactly as clients will receive it, so every machine agrees on the time.
+	const publishedState = Replication.publishClockState(script, newState)
+	clockState = publishedState
+	previousHour = Clock.getTime(publishedState, serverTime)
 
-	Replication.publishClockState(script, newState)
-	Replication.publishIsPaused(newState.Paused)
+	Replication.publishIsPaused(publishedState.Paused)
 end
 
 --[[
@@ -181,11 +199,14 @@ local function startServer()
 	const dayLengthSeconds = Config.DayLengthInMinutes * SECONDS_PER_MINUTE
 	const newState = Clock.create(startHour, Config.StartDay, dayLengthSeconds, getServerTime())
 
-	clockState = newState
-	previousHour = newState.AnchorHour
+	for eventName, eventHour in timeEvents do
+		Replication.publishTimeEvent(script, eventName, eventHour)
+	end
 
-	Replication.publishTimeEvents(script, timeEvents)
-	Replication.publishClockState(script, newState)
+	const publishedState = Replication.publishClockState(script, newState)
+	clockState = publishedState
+	previousHour = publishedState.AnchorHour
+
 	Replication.publishIsPaused(false)
 	ensureHeartbeat()
 
@@ -196,8 +217,8 @@ end
 
 -- Connections live for the lifetime of the module, as the cycle runs for the whole server.
 local function startClient()
-	Replication.observeTimeEvents(script, function(events: Types.TimeEventMap)
-		timeEvents = events
+	Replication.observeTimeEvents(script, function(eventName: string, eventHour: number?)
+		timeEvents[eventName] = eventHour
 	end)
 	Replication.observeClockState(script, onClockStateReplicated)
 
@@ -247,14 +268,19 @@ function DayNightCycle.AddTimeEvent(eventName: string, eventHour: number)
 		return
 	end
 
-	assert(typeof(eventName) == "string", "eventName must be a string")
+	Replication.assertEventName(eventName)
 	assert(
 		typeof(eventHour) == "number" and eventHour >= 0 and eventHour < HOURS_PER_DAY,
 		"eventHour must be a number between 0 and 23.99"
 	)
 
+	if timeEvents[eventName] == nil and countTimeEvents() >= Replication.MaxTimeEvents then
+		logger:warn(`Cannot add '{eventName}': at most {Replication.MaxTimeEvents} time events.`)
+		return
+	end
+
 	timeEvents[eventName] = eventHour
-	Replication.publishTimeEvents(script, timeEvents)
+	Replication.publishTimeEvent(script, eventName, eventHour)
 
 	logger:debug(`Added time event: '{eventName}' at {string.format("%.2f", eventHour)}h.`)
 end
@@ -276,7 +302,7 @@ function DayNightCycle.RemoveTimeEvent(eventName: string): boolean
 	end
 
 	timeEvents[eventName] = nil
-	Replication.publishTimeEvents(script, timeEvents)
+	Replication.publishTimeEvent(script, eventName, nil)
 
 	logger:debug(`Removed time event: '{eventName}'.`)
 	return true

@@ -8,6 +8,7 @@
 
 const Harness = require("./Harness")
 
+require("./ClockStateCodecTests")
 require("./ClockTests")
 require("./TimeEventsTests")
 

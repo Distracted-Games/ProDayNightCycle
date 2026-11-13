@@ -7,20 +7,28 @@
 	Replicates day/night cycle state from the server to clients using attributes, so late
 	joiners receive the current state automatically and no RemoteEvents are needed.
 
-	- Internal state (`ClockState`, `TimeEvents`) is stored as JSON attributes on a host
-	  instance (the DayNightCycle module's script). Each is a single attribute so clients
-	  never observe a half-updated value.
+	Attributes are limited (strings and names to 50 characters, and only the first 64
+	attributes of an instance replicate under Server Authority), so:
+	- The clock state is one short packed string (see ClockStateCodec) on a host instance
+	  (the DayNightCycle module's script). One value keeps it atomic.
+	- Each time event is its own number attribute on the host, named `TimeEvent_<eventName>`.
 	- Public state (`Day`, `IsPaused`) is stored as plain attributes on `Lighting` so HUDs
 	  and other scripts can read them without requiring the module.
 ]]
 
-const HttpService = game:GetService("HttpService")
 const Lighting = game:GetService("Lighting")
 
+const ClockStateCodec = require("./ClockStateCodec")
 const Types = require("./Types")
 
 const CLOCK_STATE_ATTRIBUTE = "ClockState"
-const TIME_EVENTS_ATTRIBUTE = "TimeEvents"
+const TIME_EVENT_PREFIX = "TimeEvent_"
+
+const MAX_ATTRIBUTE_NAME_LENGTH = 50
+const MAX_EVENT_NAME_LENGTH = MAX_ATTRIBUTE_NAME_LENGTH - #TIME_EVENT_PREFIX
+
+-- Only the first 64 attributes of an instance replicate; one is taken by the clock state.
+const MAX_TIME_EVENTS = 63
 
 -- The attribute names set on `Lighting`. Prefixed to avoid colliding with other systems.
 const PublicAttributes = table.freeze({
@@ -30,91 +38,42 @@ const PublicAttributes = table.freeze({
 
 const Replication = {
 	PublicAttributes = PublicAttributes,
+	MaxTimeEvents = MAX_TIME_EVENTS,
 }
 
--- `JSONDecode` returns `any`; every field is type-checked by the callers before use.
-local function decodeJson(encoded: unknown): any
-	if typeof(encoded) ~= "string" then
-		return nil
-	end
-
-	const success, decoded = pcall(HttpService.JSONDecode, HttpService, encoded)
-	if not success then
-		return nil
-	end
-
-	return decoded
-end
-
-local function decodeClockState(encoded: unknown): Types.ClockState?
-	const decoded = decodeJson(encoded)
-	if typeof(decoded) ~= "table" then
-		return nil
-	end
-
-	const revision = decoded.Revision
-	const anchorServerTime = decoded.AnchorServerTime
-	const anchorHour = decoded.AnchorHour
-	const anchorDay = decoded.AnchorDay
-	const dayLengthSeconds = decoded.DayLengthSeconds
-	const paused = decoded.Paused
-	const fireSkippedEvents = decoded.FireSkippedEvents
-
-	if
-		typeof(revision) ~= "number"
-		or typeof(anchorServerTime) ~= "number"
-		or typeof(anchorHour) ~= "number"
-		or typeof(anchorDay) ~= "number"
-		or typeof(dayLengthSeconds) ~= "number"
-		or typeof(paused) ~= "boolean"
-		or dayLengthSeconds <= 0
-	then
-		return nil
-	end
-
-	return {
-		Revision = revision,
-		AnchorServerTime = anchorServerTime,
-		AnchorHour = anchorHour,
-		AnchorDay = anchorDay,
-		DayLengthSeconds = dayLengthSeconds,
-		Paused = paused,
-		FireSkippedEvents = if typeof(fireSkippedEvents) == "boolean"
-			then fireSkippedEvents
-			else nil,
-	}
-end
-
-local function decodeTimeEvents(encoded: unknown): Types.TimeEventMap?
-	const decoded = decodeJson(encoded)
-	if typeof(decoded) ~= "table" then
-		return nil
-	end
-
-	const events: Types.TimeEventMap = {}
-	for eventName, eventHour in decoded do
-		if typeof(eventName) == "string" and typeof(eventHour) == "number" then
-			events[eventName] = eventHour
-		end
-	end
-
-	return events
+--[[
+	Asserts that an event name can be used as part of an attribute name.
+]]
+function Replication.assertEventName(eventName: string)
+	assert(typeof(eventName) == "string", "eventName must be a string")
+	assert(
+		string.match(eventName, "^[%w_]+$") ~= nil,
+		`Time event name '{eventName}' may only contain letters, numbers and underscores.`
+	)
+	assert(
+		#eventName <= MAX_EVENT_NAME_LENGTH,
+		`Time event name '{eventName}' must be at most {MAX_EVENT_NAME_LENGTH} characters.`
+	)
 end
 
 --[[
 	[Server] Publishes the clock state to clients.
 	@param host The instance holding the internal attributes.
+	@return The state exactly as clients will decode it, for the Server to use as well.
 ]]
-function Replication.publishClockState(host: Instance, state: Types.ClockState)
-	host:SetAttribute(CLOCK_STATE_ATTRIBUTE, HttpService:JSONEncode(state))
+function Replication.publishClockState(host: Instance, state: Types.ClockState): Types.ClockState
+	const quantized = ClockStateCodec.quantize(state)
+	host:SetAttribute(CLOCK_STATE_ATTRIBUTE, ClockStateCodec.encode(quantized))
+
+	return quantized
 end
 
 --[[
-	[Server] Publishes the time event table to clients.
+	[Server] Publishes a time event to clients, or removes it when `eventHour` is nil.
 	@param host The instance holding the internal attributes.
 ]]
-function Replication.publishTimeEvents(host: Instance, events: Types.TimeEventMap)
-	host:SetAttribute(TIME_EVENTS_ATTRIBUTE, HttpService:JSONEncode(events))
+function Replication.publishTimeEvent(host: Instance, eventName: string, eventHour: number?)
+	host:SetAttribute(TIME_EVENT_PREFIX .. eventName, eventHour)
 end
 
 --[[
@@ -142,7 +101,7 @@ function Replication.observeClockState(
 	callback: (state: Types.ClockState) -> ()
 ): RBXScriptConnection
 	local function onChanged()
-		const state = decodeClockState(host:GetAttribute(CLOCK_STATE_ATTRIBUTE))
+		const state = ClockStateCodec.decode(host:GetAttribute(CLOCK_STATE_ATTRIBUTE))
 		if state then
 			callback(state)
 		end
@@ -155,24 +114,30 @@ function Replication.observeClockState(
 end
 
 --[[
-	[Client] Calls `callback` with the current time events, if the server has published
-	them, and again every time they change. Never yields.
+	[Client] Calls `callback` for every time event the server has published, and again
+	every time one is added, changed or removed (`eventHour` is nil when removed).
+	Never yields.
 	@param host The instance holding the internal attributes.
 	@return The connection watching for changes.
 ]]
 function Replication.observeTimeEvents(
 	host: Instance,
-	callback: (events: Types.TimeEventMap) -> ()
+	callback: (eventName: string, eventHour: number?) -> ()
 ): RBXScriptConnection
-	local function onChanged()
-		const events = decodeTimeEvents(host:GetAttribute(TIME_EVENTS_ATTRIBUTE))
-		if events then
-			callback(events)
+	local function report(attributeName: string)
+		if string.sub(attributeName, 1, #TIME_EVENT_PREFIX) ~= TIME_EVENT_PREFIX then
+			return
 		end
+
+		const eventName = string.sub(attributeName, #TIME_EVENT_PREFIX + 1)
+		const eventHour = host:GetAttribute(attributeName)
+		callback(eventName, if typeof(eventHour) == "number" then eventHour else nil)
 	end
 
-	const connection = host:GetAttributeChangedSignal(TIME_EVENTS_ATTRIBUTE):Connect(onChanged)
-	onChanged()
+	const connection = host.AttributeChanged:Connect(report)
+	for attributeName in host:GetAttributes() do
+		report(attributeName)
+	end
 
 	return connection
 end
