@@ -11,6 +11,7 @@ const Harness = require("./Harness")
 require("./ClockStateCodecTests")
 require("./ClockTests")
 require("./TimeEventsTests")
+require("./LookBlendTests")
 require("./TimelineTests")
 
 const failedCount = Harness.finish()

@@ -14,6 +14,8 @@
 
 	The day is divided into phases (see Config.luau), each with a `TimeShare` that sets how
 	fast it passes in real-world time, so that e.g. the night can pass faster than the day.
+	Each phase can also have a `Look`: on Clients the lighting blends from one phase's look to
+	the next (set `Config.Lighting.Enabled = false` to control the lighting yourself).
 
 	Public state for HUDs is published as attributes on `Lighting`
 	(see `DayNightCycle.AttributeNames`):
@@ -27,7 +29,9 @@ const RunService = game:GetService("RunService")
 
 const Clock = require("./DayNightCycle/Clock")
 const Config = require("./DayNightCycle/Config")
+const LightingController = require("./DayNightCycle/LightingController")
 const Logger = require("./DayNightCycle/Logger")
+const LookBlend = require("./DayNightCycle/LookBlend")
 const Replication = require("./DayNightCycle/Replication")
 const Signal = require("./DayNightCycle/Signal")
 const TimeEvents = require("./DayNightCycle/TimeEvents")
@@ -53,6 +57,7 @@ const phaseChanged: Signal.Signal<string, string> = Signal.new()
 
 -- Maps the cycle position to game hours so each phase passes at its own speed.
 const timeline = Timeline.create(Config.Phases, Config.TimeEvents)
+LookBlend.validate(Config.Phases)
 
 -- The events that start phases. They are owned by the phases and cannot be changed.
 const phaseEventNames: { [string]: boolean } = {}
@@ -132,6 +137,20 @@ local function getServerTime(): number
 	return workspace:GetServerTimeNow()
 end
 
+--[[
+	Returns the current game hour. Before the cycle has started (or, on a Client, before the
+	Server's state arrives), this is the current Lighting time.
+]]
+local function getCurrentHour(): number
+	const state = clockState
+	if not state then
+		return Lighting:GetMinutesAfterMidnight() / MINUTES_PER_HOUR
+	end
+
+	const currentHour = Clock.getTime(state, getServerTime(), timeline)
+	return currentHour
+end
+
 local function fireTimeEvent(eventName: string, eventHour: number)
 	timeEvent:Fire(eventName, eventHour)
 	logger:debug(`Time event triggered: '{eventName}' at {string.format("%.2f", eventHour)}h.`)
@@ -158,6 +177,17 @@ local function updatePhase(hour: number)
 		phaseChanged:Fire(phaseName, previousPhase)
 		logger:debug(`Phase changed from '{previousPhase}' to '{phaseName}'.`)
 	end
+end
+
+--[[
+	Returns the current game hour, or nil until the clock has been received from the Server.
+]]
+local function getSyncedHour(): number?
+	if not clockState then
+		return nil
+	end
+
+	return getCurrentHour()
 end
 
 --[[
@@ -270,6 +300,10 @@ local function startClient()
 		timeEvents[eventName] = eventHour
 	end)
 	Replication.observeClockState(script, onClockStateReplicated)
+
+	if Config.Lighting.Enabled then
+		LightingController.start(timeline, Config.Phases, getSyncedHour)
+	end
 
 	logger:debug("Waiting for the Server's day/night cycle state...")
 end
@@ -446,13 +480,7 @@ end
 	@return The current time in hours (0-24).
 ]]
 function DayNightCycle.GetCurrentTime(): number
-	const state = clockState
-	if not state then
-		return Lighting:GetMinutesAfterMidnight() / MINUTES_PER_HOUR
-	end
-
-	const currentHour = Clock.getTime(state, getServerTime(), timeline)
-	return currentHour
+	return getCurrentHour()
 end
 
 --[[
@@ -461,7 +489,7 @@ end
 	configured. Before the cycle has started this is based on the current Lighting time.
 ]]
 function DayNightCycle.GetPhase(): string?
-	return Timeline.getPhase(timeline, DayNightCycle.GetCurrentTime())
+	return Timeline.getPhase(timeline, getCurrentHour())
 end
 
 --[[

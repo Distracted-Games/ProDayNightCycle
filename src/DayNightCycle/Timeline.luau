@@ -32,8 +32,24 @@ export type Segment = {
 	EndPosition: number,
 }
 
+--[[
+	A configured phase, with where it starts and how long it lasts in game hours.
+	- StartHour: The hour (0-24) the phase starts.
+	- LengthHours: Game hours until the next phase starts (24 if it is the only phase).
+]]
+export type PhaseInfo = {
+	Name: string,
+	StartHour: number,
+	LengthHours: number,
+}
+
+--[[
+	- Segments: The stretches of the day, in order.
+	- Phases: The configured phases, sorted by start hour. Empty if none are configured.
+]]
 export type Timeline = {
 	Segments: { Segment },
+	Phases: { PhaseInfo },
 }
 
 type ResolvedPhase = {
@@ -101,6 +117,20 @@ local function resolvePhases(
 end
 
 --[[
+	Returns how many game hours the phase at `index` lasts, and whether it crosses midnight.
+]]
+local function measurePhase(phases: { ResolvedPhase }, index: number): (number, boolean)
+	const startHour = phases[index].StartHour
+	const nextStartHour = phases[index % #phases + 1].StartHour
+	const wrapsMidnight = nextStartHour <= startHour
+
+	return if wrapsMidnight
+		then HOURS_PER_DAY - startHour + nextStartHour
+		else nextStartHour - startHour,
+		wrapsMidnight
+end
+
+--[[
 	Splits the sorted phases into pieces that each sit within a single day, weighting each
 	piece by its share of the phase's time.
 ]]
@@ -109,10 +139,7 @@ local function createPieces(phases: { ResolvedPhase }): { Piece }
 
 	for index, phase in phases do
 		const nextStartHour = phases[index % #phases + 1].StartHour
-		const wrapsMidnight = nextStartHour <= phase.StartHour
-		const phaseHours = if wrapsMidnight
-			then HOURS_PER_DAY - phase.StartHour + nextStartHour
-			else nextStartHour - phase.StartHour
+		const phaseHours, wrapsMidnight = measurePhase(phases, index)
 		const timeShare = if phase.TimeShare ~= nil then phase.TimeShare else phaseHours
 
 		if wrapsMidnight then
@@ -173,9 +200,19 @@ end
 	@param eventHours The hours of the time events, used to find where each phase starts.
 ]]
 function Timeline.create(phases: { Types.PhaseConfig }, eventHours: Types.TimeEventMap): Timeline
-	const pieces: { Piece } = if #phases == 0
+	const resolved = if #phases == 0 then {} else resolvePhases(phases, eventHours)
+	const pieces: { Piece } = if #resolved == 0
 		then { { StartHour = 0, EndHour = HOURS_PER_DAY, Weight = 1 } }
-		else createPieces(resolvePhases(phases, eventHours))
+		else createPieces(resolved)
+
+	const phaseInfos: { PhaseInfo } = {}
+	for index, phase in resolved do
+		const lengthHours = measurePhase(resolved, index)
+		table.insert(
+			phaseInfos,
+			{ Name = phase.Name, StartHour = phase.StartHour, LengthHours = lengthHours }
+		)
+	end
 
 	local totalWeight = 0
 	for _, piece in pieces do
@@ -198,7 +235,7 @@ function Timeline.create(phases: { Types.PhaseConfig }, eventHours: Types.TimeEv
 		})
 	end
 
-	return { Segments = segments }
+	return { Segments = segments, Phases = phaseInfos }
 end
 
 --[[
