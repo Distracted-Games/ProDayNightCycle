@@ -12,10 +12,14 @@
 	current time from `workspace:GetServerTimeNow()`, so there is no per-frame network
 	traffic and late joiners are in sync immediately. Clients apply the time to `Lighting`.
 
+	The day is divided into phases (see Config.luau), each with a `TimeShare` that sets how
+	fast it passes in real-world time, so that e.g. the night can pass faster than the day.
+
 	Public state for HUDs is published as attributes on `Lighting`
 	(see `DayNightCycle.AttributeNames`):
 	- Day: The current day number. Each game decides what a "day" means.
 	- IsPaused: Whether game time is paused.
+	- Phase: The name of the current phase of the day (not set if no phases are configured).
 --]]
 
 const Lighting = game:GetService("Lighting")
@@ -27,6 +31,7 @@ const Logger = require("./DayNightCycle/Logger")
 const Replication = require("./DayNightCycle/Replication")
 const Signal = require("./DayNightCycle/Signal")
 const TimeEvents = require("./DayNightCycle/TimeEvents")
+const Timeline = require("./DayNightCycle/Timeline")
 const Types = require("./DayNightCycle/Types")
 
 const HOURS_PER_DAY = 24
@@ -44,12 +49,23 @@ const logger = Logger.new({
 })
 
 const timeEvent: Signal.Signal<string, number> = Signal.new()
+const phaseChanged: Signal.Signal<string, string> = Signal.new()
+
+-- Maps the cycle position to game hours so each phase passes at its own speed.
+const timeline = Timeline.create(Config.Phases, Config.TimeEvents)
+
+-- The events that start phases. They are owned by the phases and cannot be changed.
+const phaseEventNames: { [string]: boolean } = {}
+for _, phase in Config.Phases do
+	phaseEventNames[phase.StartEvent] = true
+end
 
 -- The Server owns the events (seeded from Config); Clients receive them from the Server.
 local timeEvents: Types.TimeEventMap = if IS_SERVER then table.clone(Config.TimeEvents) else {}
 local clockState: Types.ClockState? = nil
 local previousHour = 0
 local publishedDay: number? = nil
+local currentPhase: string? = nil
 local lastRevision: number? = nil
 local hasStarted = false
 local heartbeatConnection: RBXScriptConnection? = nil
@@ -60,6 +76,13 @@ const DayNightCycle = {
 		Passes `eventName: string` and `eventHour: number`.
 	]]
 	TimeEvent = timeEvent,
+
+	--[[
+		Fires when the day moves into a new phase, on both the Server and the Clients.
+		Passes `newPhase: string` and `previousPhase: string`. It also fires when the phase
+		changes because of `SetTime`, so it always reflects the current state.
+	]]
+	PhaseChanged = phaseChanged,
 
 	-- The names of the attributes published on `Lighting`.
 	AttributeNames = Replication.PublicAttributes,
@@ -115,8 +138,32 @@ local function fireTimeEvent(eventName: string, eventHour: number)
 end
 
 --[[
-	Runs every frame on both the Server and the Clients: fires crossed events, applies the
-	time to Lighting (Clients only), and publishes the day number (Server only).
+	Tracks the current phase, firing `PhaseChanged` and publishing it (Server only) when it
+	changes. Does nothing if no phases are configured.
+]]
+local function updatePhase(hour: number)
+	const phaseName = Timeline.getPhase(timeline, hour)
+	if phaseName == nil or phaseName == currentPhase then
+		return
+	end
+
+	const previousPhase = currentPhase
+	currentPhase = phaseName
+
+	if IS_SERVER then
+		Replication.publishPhase(phaseName)
+	end
+
+	if previousPhase ~= nil then
+		phaseChanged:Fire(phaseName, previousPhase)
+		logger:debug(`Phase changed from '{previousPhase}' to '{phaseName}'.`)
+	end
+end
+
+--[[
+	Runs every frame on both the Server and the Clients: fires crossed events and phase
+	changes, applies the time to Lighting (Clients only), and publishes the day number
+	(Server only).
 ]]
 local function onHeartbeat()
 	const state = clockState
@@ -124,8 +171,9 @@ local function onHeartbeat()
 		return
 	end
 
-	const currentHour, currentDay = Clock.getTime(state, getServerTime())
+	const currentHour, currentDay = Clock.getTime(state, getServerTime(), timeline)
 	previousHour = TimeEvents.advance(timeEvents, previousHour, currentHour, fireTimeEvent)
+	updatePhase(currentHour)
 
 	if IS_CLIENT then
 		Lighting:SetMinutesAfterMidnight(currentHour * MINUTES_PER_HOUR)
@@ -154,8 +202,8 @@ local function reanchorClock(changes: Clock.Changes)
 	end
 
 	const serverTime = getServerTime()
-	const currentHour = Clock.getTime(state, serverTime)
-	const newState = Clock.reanchor(state, serverTime, changes)
+	const currentHour = Clock.getTime(state, serverTime, timeline)
+	const newState = Clock.reanchor(state, serverTime, timeline, changes)
 
 	if changes.Hour and changes.FireSkippedEvents then
 		TimeEvents.forEachCrossed(timeEvents, currentHour, changes.Hour, fireTimeEvent)
@@ -164,7 +212,7 @@ local function reanchorClock(changes: Clock.Changes)
 	-- Use the state exactly as clients will receive it, so every machine agrees on the time.
 	const publishedState = Replication.publishClockState(script, newState)
 	clockState = publishedState
-	previousHour = Clock.getTime(publishedState, serverTime)
+	previousHour = Clock.getTime(publishedState, serverTime, timeline)
 
 	Replication.publishIsPaused(publishedState.Paused)
 end
@@ -174,7 +222,7 @@ end
 ]]
 local function onClockStateReplicated(newState: Types.ClockState)
 	const serverTime = getServerTime()
-	const currentHour = Clock.getTime(newState, serverTime)
+	const currentHour = Clock.getTime(newState, serverTime, timeline)
 
 	-- A client that joined after the re-anchor never saw the old time, so nothing was skipped.
 	const isReanchor = lastRevision ~= nil and newState.Revision > lastRevision
@@ -207,6 +255,7 @@ local function startServer()
 	clockState = publishedState
 	previousHour = publishedState.AnchorHour
 
+	updatePhase(publishedState.AnchorHour)
 	Replication.publishIsPaused(false)
 	ensureHeartbeat()
 
@@ -269,6 +318,11 @@ function DayNightCycle.AddTimeEvent(eventName: string, eventHour: number)
 	end
 
 	Replication.assertEventName(eventName)
+	if phaseEventNames[eventName] then
+		logger:warn(`Cannot change '{eventName}': it starts a phase (see Config.Phases).`)
+		return
+	end
+
 	assert(
 		typeof(eventHour) == "number" and eventHour >= 0 and eventHour < HOURS_PER_DAY,
 		"eventHour must be a number between 0 and 23.99"
@@ -293,6 +347,11 @@ end
 ]]
 function DayNightCycle.RemoveTimeEvent(eventName: string): boolean
 	if not requireServer("RemoveTimeEvent") then
+		return false
+	end
+
+	if phaseEventNames[eventName] then
+		logger:warn(`Cannot remove '{eventName}': it starts a phase (see Config.Phases).`)
 		return false
 	end
 
@@ -392,8 +451,17 @@ function DayNightCycle.GetCurrentTime(): number
 		return Lighting:GetMinutesAfterMidnight() / MINUTES_PER_HOUR
 	end
 
-	const currentHour = Clock.getTime(state, getServerTime())
+	const currentHour = Clock.getTime(state, getServerTime(), timeline)
 	return currentHour
+end
+
+--[[
+	[Public Method]
+	Returns the name of the current phase of the day (e.g. "Night"), or nil if no phases are
+	configured. Before the cycle has started this is based on the current Lighting time.
+]]
+function DayNightCycle.GetPhase(): string?
+	return Timeline.getPhase(timeline, DayNightCycle.GetCurrentTime())
 end
 
 --[[
@@ -407,7 +475,7 @@ function DayNightCycle.GetDay(): number
 		return Config.StartDay
 	end
 
-	const _currentHour, currentDay = Clock.getTime(state, getServerTime())
+	const _currentHour, currentDay = Clock.getTime(state, getServerTime(), timeline)
 	return currentDay
 end
 

@@ -23,6 +23,22 @@ const Config: Types.Config = {
 		Dusk = 18.25, -- 6:15 PM
 		Midnight = 0.0, -- 12:00 AM
 	},
+
+	--[[
+		The parts of the day. Each phase starts at the hour of its `StartEvent` and lasts until
+		the next phase starts. `TimeShare` is the phase's relative share of the real-world day
+		length (only the ratios matter), so it sets how fast the phase passes. These defaults
+		make dusk and dawn linger briefly and the night pass faster than the day.
+
+		Phase start events are owned by the phases: AddTimeEvent and RemoveTimeEvent refuse
+		to change them. Set `Phases = {}` for a constant speed all day.
+	]]
+	Phases = {
+		{ Name = "Night", StartEvent = "Dusk", TimeShare = 28 },
+		{ Name = "Dawn", StartEvent = "Dawn", TimeShare = 4 },
+		{ Name = "Day", StartEvent = "Sunrise", TimeShare = 65 },
+		{ Name = "Dusk", StartEvent = "Sunset", TimeShare = 3 },
+	},
 }
 
 return Config

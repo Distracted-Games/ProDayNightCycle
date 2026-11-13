@@ -12,7 +12,7 @@
 	- The clock state is one short packed string (see ClockStateCodec) on a host instance
 	  (the DayNightCycle module's script). One value keeps it atomic.
 	- Each time event is its own number attribute on the host, named `TimeEvent_<eventName>`.
-	- Public state (`Day`, `IsPaused`) is stored as plain attributes on `Lighting` so HUDs
+	- Public state (`Day`, `IsPaused`, `Phase`) is stored as plain attributes on `Lighting` so HUDs
 	  and other scripts can read them without requiring the module.
 ]]
 
@@ -34,6 +34,7 @@ const MAX_TIME_EVENTS = 63
 const PublicAttributes = table.freeze({
 	Day = "DayNightCycle_Day",
 	IsPaused = "DayNightCycle_IsPaused",
+	Phase = "DayNightCycle_Phase",
 })
 
 const Replication = {
@@ -88,6 +89,13 @@ end
 ]]
 function Replication.publishIsPaused(isPaused: boolean)
 	Lighting:SetAttribute(PublicAttributes.IsPaused, isPaused)
+end
+
+--[[
+	[Server] Publishes the current phase name on `Lighting`.
+]]
+function Replication.publishPhase(phaseName: string)
+	Lighting:SetAttribute(PublicAttributes.Phase, phaseName)
 end
 
 --[[

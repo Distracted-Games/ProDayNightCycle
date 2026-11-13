@@ -11,6 +11,7 @@ const Harness = require("./Harness")
 require("./ClockStateCodecTests")
 require("./ClockTests")
 require("./TimeEventsTests")
+require("./TimelineTests")
 
 const failedCount = Harness.finish()
 if failedCount > 0 then

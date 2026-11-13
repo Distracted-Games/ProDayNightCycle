@@ -9,6 +9,7 @@
 	Keeping this free of Roblox services makes it testable outside of Studio.
 ]]
 
+const Timeline = require("./Timeline")
 const Types = require("./Types")
 
 const HOURS_PER_DAY = 24
@@ -57,17 +58,25 @@ end
 	Calculates the game time at a given server time.
 	@param state The clock state.
 	@param serverNow The current server time in seconds.
+	@param timeline Maps the cycle position to a game hour (see Timeline).
 	@return The game hour (0-24) and the day number.
 ]]
-function Clock.getTime(state: Types.ClockState, serverNow: number): (number, number)
+function Clock.getTime(
+	state: Types.ClockState,
+	serverNow: number,
+	timeline: Timeline.Timeline
+): (number, number)
 	-- Server time can step back slightly when the engine re-syncs it; never run backwards.
 	const elapsedSeconds = if state.Paused
 		then 0
 		else math.max(serverNow - state.AnchorServerTime, 0)
-	const totalHours = state.AnchorHour + elapsedSeconds * HOURS_PER_DAY / state.DayLengthSeconds
-	const wholeDays = math.floor(totalHours / HOURS_PER_DAY)
 
-	return totalHours - wholeDays * HOURS_PER_DAY, state.AnchorDay + wholeDays
+	-- The cycle position advances at a constant rate; the timeline turns it into an hour.
+	const totalPosition = Timeline.hourToPosition(timeline, state.AnchorHour)
+		+ elapsedSeconds / state.DayLengthSeconds
+	const wholeDays = math.floor(totalPosition)
+
+	return Timeline.positionToHour(timeline, totalPosition - wholeDays), state.AnchorDay + wholeDays
 end
 
 --[[
@@ -75,14 +84,16 @@ end
 	The game time does not jump unless `changes.Hour` is given.
 	@param state The current clock state.
 	@param serverNow The current server time in seconds.
+	@param timeline Maps the cycle position to a game hour (see Timeline).
 	@param changes What to change about the clock.
 ]]
 function Clock.reanchor(
 	state: Types.ClockState,
 	serverNow: number,
+	timeline: Timeline.Timeline,
 	changes: Changes
 ): Types.ClockState
-	const currentHour, currentDay = Clock.getTime(state, serverNow)
+	const currentHour, currentDay = Clock.getTime(state, serverNow, timeline)
 
 	return {
 		Revision = state.Revision + 1,
