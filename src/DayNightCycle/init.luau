@@ -1,349 +1,397 @@
 --!strict
 --[[
-    DayNightCycle
-    @author DistractedGames
-    @version 3.0.0
+	DayNightCycle
+	@author DistractedGames
+	@version 4.0.0
 
-    Manages the in-game day/night cycle, driven by a configurable real-world
-    duration. It provides a robust event system to trigger actions at specific
-    times of day (e.g., "Dawn", "Sunset").
+	Runs a game's day/night cycle from server start to shutdown, driven by a configurable
+	real-world duration (see Config.luau). Fires named events at specific times of day
+	(e.g. "Dawn", "Sunset") on both the Server and the Clients.
 
-    This module now runs seamlessly on both Client and Server.
-    The Server tracks time logic and broadcasts state to Clients via a RemoteEvent.
-    Clients handle the visual updates (`Lighting:SetMinutesAfterMidnight`) and fire
-    local events, while the Server also fires events for Server-side listeners.
+	The Server owns the clock and replicates it with attributes. Every machine derives the
+	current time from `workspace:GetServerTimeNow()`, so there is no per-frame network
+	traffic and late joiners are in sync immediately. Clients apply the time to `Lighting`.
+
+	Public state for HUDs is published as attributes on `Lighting`
+	(see `DayNightCycle.AttributeNames`):
+	- Day: The current day number. Each game decides what a "day" means.
+	- IsPaused: Whether game time is paused.
 --]]
 
-local Lighting = game:GetService("Lighting")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
+const Lighting = game:GetService("Lighting")
+const RunService = game:GetService("RunService")
 
-local Logger = require("./DayNightCycle/Logger")
-local Signal = require("./DayNightCycle/Signal")
+const Clock = require("./DayNightCycle/Clock")
+const Config = require("./DayNightCycle/Config")
+const Logger = require("./DayNightCycle/Logger")
+const Replication = require("./DayNightCycle/Replication")
+const Signal = require("./DayNightCycle/Signal")
+const TimeEvents = require("./DayNightCycle/TimeEvents")
+const Types = require("./DayNightCycle/Types")
 
-local isServer = RunService:IsServer()
-local isClient = RunService:IsClient()
+const HOURS_PER_DAY = 24
+const SECONDS_PER_MINUTE = 60
+const MINUTES_PER_HOUR = 60
 
-local logger = Logger.new({
+const IS_SERVER = RunService:IsServer()
+const IS_CLIENT = RunService:IsClient()
+
+export type DayNightCycleConfig = Types.Config
+
+const logger = Logger.new({
 	Debug = false, -- Toggles verbose logging for this module.
 	Prefix = "DayNightCycle",
 })
 
-local DayNightCycle = {}
+const timeEvent: Signal.Signal<string, number> = Signal.new()
 
---[[
-	Type definition for the module's configuration.
-	- DayLengthInMinutes: Real-world minutes for a full 24-hour game day.
-	- StartTimeOfDay: Optional specific start time in hours (0-24). If nil, uses current lighting.
-	- TimeEvents: A dictionary mapping event names to game hours (0-24).
-]]
-export type DayNightCycleConfig = {
-	DayLengthInMinutes: number,
-	StartTimeOfDay: number?,
-	TimeEvents: { [string]: number },
+-- The Server owns the events (seeded from Config); Clients receive them from the Server.
+local timeEvents: Types.TimeEventMap = if IS_SERVER then table.clone(Config.TimeEvents) else {}
+local clockState: Types.ClockState? = nil
+local previousHour = 0
+local publishedDay: number? = nil
+local lastRevision: number? = nil
+local hasStarted = false
+local heartbeatConnection: RBXScriptConnection? = nil
+
+const DayNightCycle = {
+	--[[
+		Fires when a configured time is reached, on both the Server and the Clients.
+		Passes `eventName: string` and `eventHour: number`.
+	]]
+	TimeEvent = timeEvent,
+
+	-- The names of the attributes published on `Lighting`.
+	AttributeNames = Replication.PublicAttributes,
 }
 
--- Default configuration, can be customized before Start() is called.
-local config: DayNightCycleConfig = {
-	DayLengthInMinutes = 180, -- A 3 hour day/night cycle.
-	StartTimeOfDay = nil, -- Uses existing Lighting time by default.
-	TimeEvents = {
-		Dawn = 4.75, -- 4:45 AM
-		Sunrise = 5.75, -- 5:45 AM
-		Midday = 12.0, -- 12:00 PM
-		Sunset = 17.6, -- 5:36 PM
-		Dusk = 18.25, -- 6:15 PM
-		Midnight = 0.0, -- 12:00 AM
-	},
-}
-
-local connection: RBXScriptConnection?
-local isRunning = false
-local lastHourTriggered = -1
-local triggeredEvents: { [string]: boolean } = {}
-local timeRatio = 0
-local cycleStartTime = 0
-local startMinutesOffset = 0
-
-local MINUTES_IN_DAY = 1440 -- 24 hours * 60 minutes
-
--- Signals & Networking
-local remotesFolder: Folder
-if isServer then
-	remotesFolder = ReplicatedStorage:FindFirstChild("Remotes") :: Folder
-	if not remotesFolder then
-		local newFolder = Instance.new("Folder")
-		newFolder.Name = "Remotes"
-		newFolder.Parent = ReplicatedStorage
-		remotesFolder = newFolder
-	end
-else
-	remotesFolder = ReplicatedStorage:WaitForChild("Remotes") :: Folder
-end
-
-local remoteEvent: RemoteEvent
-if isServer then
-	remoteEvent = remotesFolder:FindFirstChild("DayNightCycleRemote") :: RemoteEvent
-	if not remoteEvent then
-		remoteEvent = Instance.new("RemoteEvent")
-		remoteEvent.Name = "DayNightCycleRemote"
-		remoteEvent.Parent = remotesFolder
-	end
-else
-	remoteEvent = remotesFolder:WaitForChild("DayNightCycleRemote") :: RemoteEvent
-end
-
-DayNightCycle.TimeEvent = Signal.new()
-
 --[[
-	Converts minutes after midnight to a 24-hour format.
-	@param minutes The number of minutes past midnight.
-	@return The time in hours (0-24).
+	Asserts that the source configuration is usable. Runs on the Server when the cycle starts.
 ]]
-local function minutesToHours(minutes: number): number
-	return minutes / 60
-end
-
---[[
-	Checks and fires time-based events based on the current hour.
-	Resets triggered events daily at midnight.
-	Handles skipped frames/time accurately.
-	@param currentHour The current in-game hour.
-]]
-local function checkTimeEvents(currentHour: number)
-	local wrapped = false
-
-	if currentHour < lastHourTriggered then
-		-- Midnight has passed, reset all triggered events for the new day.
-		wrapped = true
-		triggeredEvents = {}
-		logger:debug("A new day has begun. Resetting daily time events.")
-	end
-
-	for eventName, eventHour in config.TimeEvents do
-		if triggeredEvents[eventName] then
-			continue
-		end
-
-		local shouldTrigger = false
-
-		if wrapped then
-			-- If time wrapped, check if the event fell in the remaining time of
-			-- yesterday, or the new time of today
-			shouldTrigger = (lastHourTriggered <= eventHour and eventHour < 24) or (eventHour <= currentHour)
-		else
-			-- Normal time progression
-			shouldTrigger = (lastHourTriggered <= eventHour and currentHour >= eventHour)
-		end
-
-		if shouldTrigger then
-			triggeredEvents[eventName] = true
-			DayNightCycle.TimeEvent:Fire(eventName, eventHour)
-			logger:debug(`Time event triggered: '{eventName}' at {string.format("%.1f", eventHour)}h.`)
-		end
-	end
-
-	lastHourTriggered = currentHour
-end
-
---[[
-	Core update function connected to Heartbeat. Calculates and sets the
-	new time of day.
-]]
-local function onHeartbeat()
-	local elapsed = time() - cycleStartTime
-	local totalMinutes = (startMinutesOffset + (elapsed * timeRatio)) % MINUTES_IN_DAY
-
-	-- Only the Client manages the visual Lighting property to save network bandwidth
-	if isClient then
-		Lighting:SetMinutesAfterMidnight(totalMinutes)
-	end
-
-	local currentHour = minutesToHours(totalMinutes)
-	checkTimeEvents(currentHour)
-end
-
--- Setup Client Remote Listeners
-if isClient then
-	remoteEvent.OnClientEvent:Connect(function(action: string, ...: any)
-		if action == "Sync" or action == "Start" then
-			local sentCurrentMinutes, sentTimeRatio, serverTimeEvents = ...
-
-			config.TimeEvents = serverTimeEvents
-			timeRatio = sentTimeRatio
-			startMinutesOffset = sentCurrentMinutes
-			cycleStartTime = time()
-
-			lastHourTriggered = minutesToHours(startMinutesOffset)
-
-			if not isRunning then
-				isRunning = true
-				connection = RunService.Heartbeat:Connect(onHeartbeat)
-			end
-
-			logger:debug(`Client DayNightCycle {action == "Start" and "started" or "synced"}.`)
-		elseif action == "Stop" then
-			DayNightCycle.StopCycle()
-		elseif action == "AddEvent" then
-			local eventName, eventHour = ...
-			config.TimeEvents[eventName] = eventHour
-		elseif action == "RemoveEvent" then
-			local eventName = ...
-			config.TimeEvents[eventName] = nil
-		end
-	end)
-end
-
--- Setup Server Remote Listeners
-if isServer then
-	remoteEvent.OnServerEvent:Connect(function(player: Player, action: string)
-		if action == "RequestSync" and isRunning then
-			-- Calculate current minutes
-			local elapsed = time() - cycleStartTime
-			local currentMinutes = (startMinutesOffset + (elapsed * timeRatio)) % MINUTES_IN_DAY
-
-			-- Send current state to the late-joining client
-			remoteEvent:FireClient(player, "Sync", currentMinutes, timeRatio, config.TimeEvents)
-		end
-	end)
-end
-
---[[
-	[Public Method]
-	Starts the day/night cycle. Connects the update function to RunService.Heartbeat.
-	Calling it again will have no effect.
-]]
-function DayNightCycle.StartCycle()
-	if isRunning then
-		logger:warn("StartCycle called but the cycle is already running.")
-		return
-	end
-	isRunning = true
-
-	local dayInSeconds = config.DayLengthInMinutes * 60
-	timeRatio = MINUTES_IN_DAY / dayInSeconds
-	cycleStartTime = time()
-
-	startMinutesOffset = Lighting:GetMinutesAfterMidnight()
-	if config.StartTimeOfDay then
-		startMinutesOffset = config.StartTimeOfDay * 60
-	end
-
-	-- Initialize lastHourTriggered so events don't immediately burst on start
-	lastHourTriggered = minutesToHours(startMinutesOffset)
-
-	-- Apply time to lighting if we are on the client (or running local test)
-	if isClient then
-		Lighting:SetMinutesAfterMidnight(startMinutesOffset)
-	end
-
-	connection = RunService.Heartbeat:Connect(onHeartbeat)
-
-	if isServer then
-		remoteEvent:FireAllClients("Start", startMinutesOffset, timeRatio, config.TimeEvents)
-	end
-
-	logger:debug(`Day/Night cycle started. Game day lasts {config.DayLengthInMinutes} real-world minutes.`)
-end
-
---[[
-	[Public Method]
-	Stops the day/night cycle.
-]]
-function DayNightCycle.StopCycle()
-	if not isRunning then
-		return
-	end
-	isRunning = false
-
-	if connection then
-		connection:Disconnect()
-		connection = nil
-	end
-
-	if isServer then
-		remoteEvent:FireAllClients("Stop")
-	end
-
-	logger:debug("Day/Night cycle stopped.")
-end
-
---[[
-    [Public Method]
-    Adds or updates a custom time event.
-    @param eventName The unique name for the event.
-    @param eventHour The hour (0-24) to trigger the event.
-]]
-function DayNightCycle.AddTimeEvent(eventName: string, eventHour: number)
-	assert(typeof(eventName) == "string", "eventName must be a string")
+local function validateConfig(config: Types.Config)
 	assert(
-		typeof(eventHour) == "number" and eventHour >= 0 and eventHour < 24,
-		"eventHour must be a number between 0 and 23.99"
+		config.DayLengthInMinutes > 0 and config.DayLengthInMinutes < math.huge,
+		"Config.DayLengthInMinutes must be a positive number."
 	)
 
-	config.TimeEvents[eventName] = eventHour
+	const startTimeOfDay = config.StartTimeOfDay
+	assert(
+		startTimeOfDay == nil or (startTimeOfDay >= 0 and startTimeOfDay <= HOURS_PER_DAY),
+		"Config.StartTimeOfDay must be nil or a number between 0 and 24."
+	)
 
-	if isServer then
-		remoteEvent:FireAllClients("AddEvent", eventName, eventHour)
+	for eventName, eventHour in config.TimeEvents do
+		assert(
+			eventHour >= 0 and eventHour < HOURS_PER_DAY,
+			`Config.TimeEvents.{eventName} must be a number between 0 and 23.99.`
+		)
 	end
+end
 
-	logger:debug(`Added time event: {eventName} at {string.format("%.1f", eventHour)}h.`)
+local function getServerTime(): number
+	return workspace:GetServerTimeNow()
+end
+
+local function fireTimeEvent(eventName: string, eventHour: number)
+	timeEvent:Fire(eventName, eventHour)
+	logger:debug(`Time event triggered: '{eventName}' at {string.format("%.2f", eventHour)}h.`)
 end
 
 --[[
-	[Public Method]
-	Removes a time event.
-	@param eventName The name of the event to remove.
-	@return True if the event was found and removed, false otherwise.
---]]
-function DayNightCycle.RemoveTimeEvent(eventName: string): boolean
-	if config.TimeEvents[eventName] then
-		config.TimeEvents[eventName] = nil
+	Runs every frame on both the Server and the Clients: fires crossed events, applies the
+	time to Lighting (Clients only), and publishes the day number (Server only).
+]]
+local function onHeartbeat()
+	const state = clockState
+	if not state then
+		return
+	end
 
-		if isServer then
-			remoteEvent:FireAllClients("RemoveEvent", eventName)
-		end
+	const currentHour, currentDay = Clock.getTime(state, getServerTime())
+	previousHour = TimeEvents.advance(timeEvents, previousHour, currentHour, fireTimeEvent)
 
-		logger:debug(`Removed time event: '{eventName}'.`)
+	if IS_CLIENT then
+		Lighting:SetMinutesAfterMidnight(currentHour * MINUTES_PER_HOUR)
+	end
+
+	if IS_SERVER and currentDay ~= publishedDay then
+		publishedDay = currentDay
+		Replication.publishDay(currentDay)
+	end
+end
+
+local function ensureHeartbeat()
+	if not heartbeatConnection then
+		heartbeatConnection = RunService.Heartbeat:Connect(onHeartbeat)
+	end
+end
+
+--[[
+	[Server] Re-anchors the clock at the current moment, applying `changes`, and publishes it.
+]]
+local function reanchorClock(changes: Clock.Changes)
+	const state = clockState
+	if not state then
+		logger:warn("The cycle has not been started yet.")
+		return
+	end
+
+	const serverTime = getServerTime()
+	const currentHour = Clock.getTime(state, serverTime)
+	const newState = Clock.reanchor(state, serverTime, changes)
+
+	if changes.Hour and changes.FireSkippedEvents then
+		TimeEvents.forEachCrossed(timeEvents, currentHour, changes.Hour, fireTimeEvent)
+	end
+
+	clockState = newState
+	previousHour = Clock.getTime(newState, serverTime)
+
+	Replication.publishClockState(script, newState)
+	Replication.publishIsPaused(newState.Paused)
+end
+
+--[[
+	[Client] Handles the Server publishing a clock state (first sync, or a re-anchor).
+]]
+local function onClockStateReplicated(newState: Types.ClockState)
+	const serverTime = getServerTime()
+	const currentHour = Clock.getTime(newState, serverTime)
+
+	-- A client that joined after the re-anchor never saw the old time, so nothing was skipped.
+	const isReanchor = lastRevision ~= nil and newState.Revision > lastRevision
+	if isReanchor and newState.FireSkippedEvents then
+		TimeEvents.forEachCrossed(timeEvents, previousHour, currentHour, fireTimeEvent)
+	end
+
+	-- Time may have jumped; resume event detection from the new hour without firing.
+	lastRevision = newState.Revision
+	clockState = newState
+	previousHour = currentHour
+
+	ensureHeartbeat()
+end
+
+local function startServer()
+	validateConfig(Config)
+
+	const startHour = if Config.StartTimeOfDay
+		then Config.StartTimeOfDay
+		else Lighting:GetMinutesAfterMidnight() / MINUTES_PER_HOUR
+	const dayLengthSeconds = Config.DayLengthInMinutes * SECONDS_PER_MINUTE
+	const newState = Clock.create(startHour, Config.StartDay, dayLengthSeconds, getServerTime())
+
+	clockState = newState
+	previousHour = newState.AnchorHour
+
+	Replication.publishTimeEvents(script, timeEvents)
+	Replication.publishClockState(script, newState)
+	Replication.publishIsPaused(false)
+	ensureHeartbeat()
+
+	logger:debug(
+		`Day/Night cycle started. A game day lasts {Config.DayLengthInMinutes} real-world minutes.`
+	)
+end
+
+-- Connections live for the lifetime of the module, as the cycle runs for the whole server.
+local function startClient()
+	Replication.observeTimeEvents(script, function(events: Types.TimeEventMap)
+		timeEvents = events
+	end)
+	Replication.observeClockState(script, onClockStateReplicated)
+
+	logger:debug("Waiting for the Server's day/night cycle state...")
+end
+
+--[[
+	Returns whether the caller is the Server, warning if not.
+]]
+local function requireServer(functionName: string): boolean
+	if IS_SERVER then
 		return true
 	end
-	logger:warn(`Attempted to remove non-existent event: '{eventName}'.`)
+
+	logger:warn(`{functionName} can only be called on the Server.`)
 	return false
 end
 
 --[[
-    [Public Method]
-    Returns the current in-game time.
-    @return The current time in hours (0-24).
+	[Public Method]
+	Starts the day/night cycle. On the Server this starts the clock; on a Client this
+	begins following the Server's clock, including when joining a cycle already in progress.
+	Call this once on the Server and once on each Client.
 ]]
-function DayNightCycle.GetCurrentTime(): number
-	local elapsed = time() - cycleStartTime
-	local totalMinutes = (startMinutesOffset + (elapsed * timeRatio)) % MINUTES_IN_DAY
-	return minutesToHours(totalMinutes)
+function DayNightCycle.Start()
+	if hasStarted then
+		logger:warn("Start called but the cycle has already been started.")
+		return
+	end
+	hasStarted = true
+
+	if IS_SERVER then
+		startServer()
+	else
+		startClient()
+	end
 end
 
 --[[
-    ModuleLoader Lifecycle: Start
-    Starts the actual day/night cycle. This runs after all modules have been
-    through their Setup phase.
-    
-    NOTE: If this module is placed in ReplicatedStorage, the ModuleLoader will
-    only automatically call Start() on the Client. You must manually call 
-    DayNightCycle.Start() from your ServerStart script (after all modules have started).
-
-	If you're not using the ModuleLoader at all, you will manually need to call
-	Start() from both the client and the server.
+	[Public Method] [Server only]
+	Adds or updates a custom time event. Replicates to all Clients.
+	@param eventName The unique name for the event.
+	@param eventHour The hour (0-24) to trigger the event.
 ]]
-function DayNightCycle.Start()
-	logger:debug(`Starting Day/Night Cycle...`)
-
-	if isServer then
-		DayNightCycle.StartCycle()
-	else
-		-- When the client's module loader starts this, it should request state from the server
-		-- in case the cycle is already running.
-		remoteEvent:FireServer("RequestSync")
+function DayNightCycle.AddTimeEvent(eventName: string, eventHour: number)
+	if not requireServer("AddTimeEvent") then
+		return
 	end
+
+	assert(typeof(eventName) == "string", "eventName must be a string")
+	assert(
+		typeof(eventHour) == "number" and eventHour >= 0 and eventHour < HOURS_PER_DAY,
+		"eventHour must be a number between 0 and 23.99"
+	)
+
+	timeEvents[eventName] = eventHour
+	Replication.publishTimeEvents(script, timeEvents)
+
+	logger:debug(`Added time event: '{eventName}' at {string.format("%.2f", eventHour)}h.`)
+end
+
+--[[
+	[Public Method] [Server only]
+	Removes a time event. Replicates to all Clients.
+	@param eventName The name of the event to remove.
+	@return True if the event was found and removed, false otherwise.
+]]
+function DayNightCycle.RemoveTimeEvent(eventName: string): boolean
+	if not requireServer("RemoveTimeEvent") then
+		return false
+	end
+
+	if timeEvents[eventName] == nil then
+		logger:warn(`Attempted to remove non-existent event: '{eventName}'.`)
+		return false
+	end
+
+	timeEvents[eventName] = nil
+	Replication.publishTimeEvents(script, timeEvents)
+
+	logger:debug(`Removed time event: '{eventName}'.`)
+	return true
+end
+
+--[[
+	[Public Method] [Server only]
+	Freezes game time at the current moment. Time events do not fire while paused.
+]]
+function DayNightCycle.Pause()
+	if not requireServer("Pause") then
+		return
+	end
+	if clockState and clockState.Paused then
+		return
+	end
+
+	reanchorClock({ Paused = true })
+	logger:debug("Day/Night cycle paused.")
+end
+
+--[[
+	[Public Method] [Server only]
+	Resumes game time from where it was paused.
+]]
+function DayNightCycle.Resume()
+	if not requireServer("Resume") then
+		return
+	end
+	if clockState and not clockState.Paused then
+		return
+	end
+
+	reanchorClock({ Paused = false })
+	logger:debug("Day/Night cycle resumed.")
+end
+
+--[[
+	[Public Method] [Server only]
+	Jumps to a time of day on the current day. `Day` is not changed.
+	@param hour The hour (0-24) to jump to.
+	@param fireSkippedEvents If true, events between the current time and the new time
+	(moving forward, wrapping past midnight) fire in order. Otherwise the jump is silent.
+]]
+function DayNightCycle.SetTime(hour: number, fireSkippedEvents: boolean?)
+	if not requireServer("SetTime") then
+		return
+	end
+
+	assert(
+		typeof(hour) == "number" and hour >= 0 and hour <= HOURS_PER_DAY,
+		"hour must be a number between 0 and 24"
+	)
+
+	reanchorClock({ Hour = hour, FireSkippedEvents = fireSkippedEvents })
+	logger:debug(`Day/Night cycle time set to {string.format("%.2f", hour)}h.`)
+end
+
+--[[
+	[Public Method] [Server only]
+	Changes how many real-world minutes a full game day lasts, keeping the current time.
+	@param minutes Real-world minutes for a full 24-hour game day.
+]]
+function DayNightCycle.SetDayLength(minutes: number)
+	if not requireServer("SetDayLength") then
+		return
+	end
+
+	assert(
+		typeof(minutes) == "number" and minutes > 0 and minutes < math.huge,
+		"minutes must be a positive number"
+	)
+
+	reanchorClock({ DayLengthSeconds = minutes * SECONDS_PER_MINUTE })
+	logger:debug(`Day/Night cycle day length set to {minutes} real-world minutes.`)
+end
+
+--[[
+	[Public Method]
+	Returns the current in-game time. Before the cycle has started (or, on a Client, before
+	the Server's state arrives), this is the current Lighting time.
+	@return The current time in hours (0-24).
+]]
+function DayNightCycle.GetCurrentTime(): number
+	const state = clockState
+	if not state then
+		return Lighting:GetMinutesAfterMidnight() / MINUTES_PER_HOUR
+	end
+
+	const currentHour = Clock.getTime(state, getServerTime())
+	return currentHour
+end
+
+--[[
+	[Public Method]
+	Returns the current day number, which starts at `Config.StartDay` and increases each
+	midnight. Before the cycle has started this is `Config.StartDay`.
+]]
+function DayNightCycle.GetDay(): number
+	const state = clockState
+	if not state then
+		return Config.StartDay
+	end
+
+	const _currentHour, currentDay = Clock.getTime(state, getServerTime())
+	return currentDay
+end
+
+--[[
+	[Public Method]
+	Returns whether game time is currently paused.
+]]
+function DayNightCycle.IsPaused(): boolean
+	const state = clockState
+	return state ~= nil and state.Paused
 end
 
 return table.freeze(DayNightCycle)
