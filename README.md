@@ -19,9 +19,11 @@ The server owns the clock and replicates it with attributes. Every machine deriv
 
 The easiest way to install DayNightCycle is to grab the latest `.rbxm` release.
 
-1. Download the `DayNightCycle.rbxm` file from the [Latest Release Page](https://github.com/Distracted-Games/ProDayNightCycle/releases/latest).
-2. Drag and drop the `.rbxm` file into Roblox Studio.
-3. Because this module must run on both the Client and the Server, place the `DayNightCycle` module into **ReplicatedStorage**.
+1. Download the `DayNightCycle.rbxl` file from the [Latest Release Page](https://github.com/Distracted-Games/ProDayNightCycle/releases/latest).
+2. Open the `.rbxl` file in Roblox Studio.
+3. Everything you need is set up in that place, including `ServerAuthority` and the primary module being in the `ReplicatedStorage/Source/Simulation` folder, plus my [`ModuleLoader`](https://github.com/Distracted-Games/ModuleLoader) setup. 
+
+If you use the above installation method and want to move the files into your own project, make sure to include the `ReplicatedStorage/Source/Utility/Logger` and `ReplicatedStorage/Source/Libs/Signal` modules as well. These are direct dependencies of the primary module. If not using my `ModuleLoader`, you will need to be sure and `require()` and call `DayNightCycle.Start()` from both the server and client.
 
 ## Configuration
 
