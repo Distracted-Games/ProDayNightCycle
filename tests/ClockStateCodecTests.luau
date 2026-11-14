@@ -73,4 +73,24 @@ Harness.test("rejects invalid values", function()
 	Harness.expectEqual(ClockStateCodec.decode("1|2|3|4|0|0"), nil)
 end)
 
+Harness.test("an hour that rounds up to 24 becomes the start of the next day", function()
+	const state = createState()
+	state.AnchorHour = 23.999996
+	state.AnchorDay = 5
+	const quantized = ClockStateCodec.quantize(state)
+
+	Harness.expectEqual(quantized.AnchorHour, 0)
+	Harness.expectEqual(quantized.AnchorDay, 6)
+end)
+
+Harness.test("an hour that rounds down below 24 keeps its day", function()
+	const state = createState()
+	state.AnchorHour = 23.999994
+	state.AnchorDay = 5
+	const quantized = ClockStateCodec.quantize(state)
+
+	Harness.expectNear(quantized.AnchorHour, 23.99999)
+	Harness.expectEqual(quantized.AnchorDay, 5)
+end)
+
 return true

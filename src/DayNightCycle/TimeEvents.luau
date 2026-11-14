@@ -7,15 +7,14 @@
 	Pure detection of which named time events were crossed as the clock moved forward.
 	An event is crossed when its hour lies in the half-open range (fromHour, toHour], which
 	handles the midnight wrap and removes any need to remember which events already fired.
+	The caller must only pass ranges that moved forward by less than a day (the Server time
+	it derives them from never runs backwards).
 	Keeping this free of Roblox services makes it testable outside of Studio.
 ]]
 
 const Types = require("./Types")
 
 const HOURS_PER_DAY = 24
-
--- A backwards step smaller than this is clock jitter, not a wrap past midnight.
-const BACKWARD_JITTER_LIMIT_HOURS = HOURS_PER_DAY / 2
 
 export type EventCallback = (eventName: string, eventHour: number) -> ()
 
@@ -88,31 +87,6 @@ function TimeEvents.forEachCrossed(
 	for _, crossedEvent in crossedEvents do
 		callback(crossedEvent.Name, crossedEvent.Hour)
 	end
-end
-
---[[
-	Advances event detection by one step of the running clock.
-	@param events The events to check.
-	@param previousHour The hour returned by the previous call.
-	@param currentHour The current game hour.
-	@param callback Called for each event crossed since `previousHour`.
-	@return The hour to pass as `previousHour` next time. This is `currentHour`, except for
-	a small backwards step (server time re-sync), which is ignored so events cannot repeat.
-]]
-function TimeEvents.advance(
-	events: Types.TimeEventMap,
-	previousHour: number,
-	currentHour: number,
-	callback: EventCallback
-): number
-	const backwardsHours = previousHour - currentHour
-	if backwardsHours > 0 and backwardsHours < BACKWARD_JITTER_LIMIT_HOURS then
-		return previousHour
-	end
-
-	TimeEvents.forEachCrossed(events, previousHour, currentHour, callback)
-
-	return currentHour
 end
 
 return table.freeze(TimeEvents)

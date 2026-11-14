@@ -10,21 +10,13 @@ const EVENTS = {
 	Midnight = 0,
 }
 
---[[
-	Runs `advance` and returns the names of the fired events, in order, along with the
-	hour to use next.
-]]
-local function advance(
-	events: { [string]: number },
-	previousHour: number,
-	currentHour: number
-): ({ string }, number)
+local function crossed(events: { [string]: number }, fromHour: number, toHour: number): { string }
 	const fired: { string } = {}
-	const nextHour = TimeEvents.advance(events, previousHour, currentHour, function(eventName)
+	TimeEvents.forEachCrossed(events, fromHour, toHour, function(eventName)
 		table.insert(fired, eventName)
 	end)
 
-	return fired, nextHour
+	return fired
 end
 
 local function expectFired(actual: { string }, expected: { string })
@@ -34,63 +26,41 @@ end
 print("TimeEvents")
 
 Harness.test("fires an event crossed this step", function()
-	const fired, nextHour = advance(EVENTS, 11.9, 12.1)
-
-	expectFired(fired, { "Midday" })
-	Harness.expectNear(nextHour, 12.1)
+	expectFired(crossed(EVENTS, 11.9, 12.1), { "Midday" })
 end)
 
 Harness.test("does not fire when no event is crossed", function()
-	const fired = advance(EVENTS, 8, 9)
-
-	expectFired(fired, {})
+	expectFired(crossed(EVENTS, 8, 9), {})
 end)
 
 Harness.test("fires an event exactly at the current hour", function()
-	expectFired((advance(EVENTS, 11, 12)), { "Midday" })
+	expectFired(crossed(EVENTS, 11, 12), { "Midday" })
 end)
 
 Harness.test("does not fire an event exactly at the previous hour again", function()
-	expectFired((advance(EVENTS, 12, 12.5)), {})
+	expectFired(crossed(EVENTS, 12, 12.5), {})
 end)
 
 Harness.test("does not fire while the hour is unchanged", function()
-	expectFired((advance(EVENTS, 12, 12)), {})
+	expectFired(crossed(EVENTS, 12, 12), {})
 end)
 
 Harness.test("fires events at midnight when the day wraps", function()
-	const fired = advance({ Midnight = 0, Late = 23.995 }, 23.99, 0.01)
-
-	expectFired(fired, { "Late", "Midnight" })
+	expectFired(crossed({ Midnight = 0, Late = 23.995 }, 23.99, 0.01), { "Late", "Midnight" })
 end)
 
 Harness.test("an event at hour 0 does not fire mid-day", function()
-	expectFired((advance(EVENTS, 10, 11)), {})
+	expectFired(crossed(EVENTS, 10, 11), {})
 end)
 
 Harness.test("fires events spanning the wrap in the order crossed", function()
 	-- From 23:00 to 5:00 crosses Midnight and Dawn.
-	const fired = advance(EVENTS, 23, 5)
-
-	expectFired(fired, { "Midnight", "Dawn" })
+	expectFired(crossed(EVENTS, 23, 5), { "Midnight", "Dawn" })
 end)
 
-Harness.test("ignores a small backwards step and keeps the previous hour", function()
-	const fired, nextHour = advance(EVENTS, 12.001, 12)
-
-	expectFired(fired, {})
-	Harness.expectNear(nextHour, 12.001)
-end)
-
-Harness.test("does not repeat an event after a small backwards step", function()
-	const events = { Midday = 12 }
-	const firedFirst, hourAfterFirst = advance(events, 11.999, 12.001)
-	const firedBack, hourAfterBack = advance(events, hourAfterFirst, 12)
-	const firedAgain = advance(events, hourAfterBack, 12.002)
-
-	expectFired(firedFirst, { "Midday" })
-	expectFired(firedBack, {})
-	expectFired(firedAgain, {})
+Harness.test("fires every event of a long forward step, with no jitter guessing", function()
+	-- 14:00 to 4:00 is a 14 hour step. It crosses Midnight and nothing else.
+	expectFired(crossed(EVENTS, 14, 4), { "Dusk", "Midnight" })
 end)
 
 Harness.test("forEachCrossed fires in hour order across a large forward jump", function()

@@ -2,7 +2,7 @@
 --[[
 	DayNightCycle
 	@author DistractedGames
-	@version 4.0.0
+	@version 4.0.1
 
 	Runs a game's day/night cycle from server start to shutdown, driven by a configurable
 	real-world duration (see Config.luau). Fires named events at specific times of day
@@ -39,6 +39,10 @@ const Timeline = require("./DayNightCycle/Timeline")
 const Types = require("./DayNightCycle/Types")
 
 const HOURS_PER_DAY = 24
+
+-- After a stall (a backgrounded app, a long hitch), only time events from the last this many
+-- real-world seconds still fire; older ones are skipped instead of replayed all at once.
+const CATCH_UP_SECONDS = 30
 const SECONDS_PER_MINUTE = 60
 const MINUTES_PER_HOUR = 60
 
@@ -69,6 +73,9 @@ end
 local timeEvents: Types.TimeEventMap = if IS_SERVER then table.clone(Config.TimeEvents) else {}
 local clockState: Types.ClockState? = nil
 local previousHour = 0
+local previousServerTime = 0
+local latestServerTime = 0
+local fireSkippedEventsPending = false
 local publishedDay: number? = nil
 local currentPhase: string? = nil
 local lastRevision: number? = nil
@@ -85,7 +92,8 @@ const DayNightCycle = {
 	--[[
 		Fires when the day moves into a new phase, on both the Server and the Clients.
 		Passes `newPhase: string` and `previousPhase: string`. It also fires when the phase
-		changes because of `SetTime`, so it always reflects the current state.
+		changes because of `SetTime`, so it always reflects the current state. When a
+		frame brings both a phase change and time events, this fires first.
 	]]
 	PhaseChanged = phaseChanged,
 
@@ -133,8 +141,14 @@ local function countTimeEvents(): number
 	return eventCount
 end
 
+--[[
+	Returns the server time, which never runs backwards. The engine can step its estimate of
+	the server time back slightly when it re-syncs; holding the latest value keeps the game
+	time, the lighting and the time events from ever moving backwards with it.
+]]
 local function getServerTime(): number
-	return workspace:GetServerTimeNow()
+	latestServerTime = math.max(latestServerTime, workspace:GetServerTimeNow())
+	return latestServerTime
 end
 
 --[[
@@ -156,14 +170,21 @@ local function fireTimeEvent(eventName: string, eventHour: number)
 	logger:debug(`Time event triggered: '{eventName}' at {string.format("%.2f", eventHour)}h.`)
 end
 
+type PhaseChange = {
+	New: string,
+	Previous: string,
+}
+
 --[[
-	Tracks the current phase, firing `PhaseChanged` and publishing it (Server only) when it
-	changes. Does nothing if no phases are configured.
+	Tracks the current phase and publishes it (Server only). Does nothing if no phases are
+	configured. Signals are fired separately (see `firePhaseChange`) so that all of the state
+	is up to date before any listener runs.
+	@return The change, or nil if the phase is the same. The first phase is not a change.
 ]]
-local function updatePhase(hour: number)
+local function commitPhase(hour: number): PhaseChange?
 	const phaseName = Timeline.getPhase(timeline, hour)
 	if phaseName == nil or phaseName == currentPhase then
-		return
+		return nil
 	end
 
 	const previousPhase = currentPhase
@@ -173,9 +194,40 @@ local function updatePhase(hour: number)
 		Replication.publishPhase(phaseName)
 	end
 
-	if previousPhase ~= nil then
-		phaseChanged:Fire(phaseName, previousPhase)
-		logger:debug(`Phase changed from '{previousPhase}' to '{phaseName}'.`)
+	if previousPhase == nil then
+		return nil
+	end
+
+	return { New = phaseName, Previous = previousPhase }
+end
+
+local function firePhaseChange(change: PhaseChange?)
+	if change == nil then
+		return
+	end
+
+	phaseChanged:Fire(change.New, change.Previous)
+	logger:debug(`Phase changed from '{change.Previous}' to '{change.New}'.`)
+end
+
+--[[
+	Publishes the day number when it changes (Server only).
+]]
+local function publishDay(day: number)
+	if not IS_SERVER or day == publishedDay then
+		return
+	end
+
+	publishedDay = day
+	Replication.publishDay(day)
+end
+
+--[[
+	Applies the game hour to `Lighting` (Clients only).
+]]
+local function applyClientTime(hour: number)
+	if IS_CLIENT then
+		Lighting:SetMinutesAfterMidnight(hour * MINUTES_PER_HOUR)
 	end
 end
 
@@ -191,9 +243,10 @@ local function getSyncedHour(): number?
 end
 
 --[[
-	Runs every frame on both the Server and the Clients: fires crossed events and phase
-	changes, applies the time to Lighting (Clients only), and publishes the day number
-	(Server only).
+	Runs every frame on both the Server and the Clients. All of the state a listener could look
+	at (the time, the day, the phase and the Lighting) is brought up to date first, and only
+	then are the phase change and the crossed events fired. Listeners can therefore read the
+	current state, and call functions like `SetTime`, without their changes being overwritten.
 ]]
 local function onHeartbeat()
 	const state = clockState
@@ -201,18 +254,28 @@ local function onHeartbeat()
 		return
 	end
 
-	const currentHour, currentDay = Clock.getTime(state, getServerTime(), timeline)
-	previousHour = TimeEvents.advance(timeEvents, previousHour, currentHour, fireTimeEvent)
-	updatePhase(currentHour)
+	-- A new frame: re-anchors from now on are replicated separately from earlier ones.
+	fireSkippedEventsPending = false
 
-	if IS_CLIENT then
-		Lighting:SetMinutesAfterMidnight(currentHour * MINUTES_PER_HOUR)
-	end
+	const serverNow = getServerTime()
+	const currentHour, currentDay = Clock.getTime(state, serverNow, timeline)
+	const fromHour = Clock.getEventStartHour(
+		state,
+		timeline,
+		previousHour,
+		previousServerTime,
+		serverNow,
+		CATCH_UP_SECONDS
+	)
+	previousHour = currentHour
+	previousServerTime = serverNow
 
-	if IS_SERVER and currentDay ~= publishedDay then
-		publishedDay = currentDay
-		Replication.publishDay(currentDay)
-	end
+	applyClientTime(currentHour)
+	publishDay(currentDay)
+	const phaseChange = commitPhase(currentHour)
+
+	firePhaseChange(phaseChange)
+	TimeEvents.forEachCrossed(timeEvents, fromHour, currentHour, fireTimeEvent)
 end
 
 local function ensureHeartbeat()
@@ -223,6 +286,8 @@ end
 
 --[[
 	[Server] Re-anchors the clock at the current moment, applying `changes`, and publishes it.
+	The new state is committed before any event fires, so listeners see it and can safely
+	change the clock again.
 ]]
 local function reanchorClock(changes: Clock.Changes)
 	const state = clockState
@@ -231,41 +296,71 @@ local function reanchorClock(changes: Clock.Changes)
 		return
 	end
 
-	const serverTime = getServerTime()
-	const currentHour = Clock.getTime(state, serverTime, timeline)
-	const newState = Clock.reanchor(state, serverTime, timeline, changes)
-
-	if changes.Hour and changes.FireSkippedEvents then
-		TimeEvents.forEachCrossed(timeEvents, currentHour, changes.Hour, fireTimeEvent)
+	-- Attribute changes made in the same frame replicate as only the last one. So a re-anchor
+	-- that leaves the time alone (e.g. Pause) keeps a `SetTime(hour, true)` from this frame
+	-- marked, or Clients would never fire its skipped events.
+	if changes.Hour ~= nil then
+		fireSkippedEventsPending = changes.FireSkippedEvents == true
+	elseif fireSkippedEventsPending then
+		changes.FireSkippedEvents = true
 	end
+
+	const serverTime = getServerTime()
+	const hourBeforeChange = Clock.getTime(state, serverTime, timeline)
+	const newState = Clock.reanchor(state, serverTime, timeline, changes)
 
 	-- Use the state exactly as clients will receive it, so every machine agrees on the time.
 	const publishedState = Replication.publishClockState(script, newState)
 	clockState = publishedState
-	previousHour = Clock.getTime(publishedState, serverTime, timeline)
+
+	const newHour, newDay = Clock.getTime(publishedState, serverTime, timeline)
+	previousHour = newHour
+	previousServerTime = serverTime
 
 	Replication.publishIsPaused(publishedState.Paused)
+	publishDay(newDay)
+	const phaseChange = commitPhase(newHour)
+
+	firePhaseChange(phaseChange)
+	if changes.Hour ~= nil and changes.FireSkippedEvents then
+		TimeEvents.forEachCrossed(timeEvents, hourBeforeChange, newHour, fireTimeEvent)
+	end
 end
 
 --[[
 	[Client] Handles the Server publishing a clock state (first sync, or a re-anchor).
 ]]
 local function onClockStateReplicated(newState: Types.ClockState)
-	const serverTime = getServerTime()
-	const currentHour = Clock.getTime(newState, serverTime, timeline)
+	const serverNow = getServerTime()
+	const currentHour = Clock.getTime(newState, serverNow, timeline)
 
 	-- A client that joined after the re-anchor never saw the old time, so nothing was skipped.
+	const oldState = clockState
 	const isReanchor = lastRevision ~= nil and newState.Revision > lastRevision
-	if isReanchor and newState.FireSkippedEvents then
-		TimeEvents.forEachCrossed(timeEvents, previousHour, currentHour, fireTimeEvent)
+	local skippedFromHour: number? = nil
+	if oldState and isReanchor and newState.FireSkippedEvents then
+		-- The jump skips everything after the moment the Server re-anchored. Events before that
+		-- moment already fired, or (after a stall) are too old to fire, so start from whichever
+		-- is later: the last step or the re-anchor.
+		skippedFromHour = if previousServerTime >= newState.AnchorServerTime
+			then previousHour
+			else Clock.getTime(oldState, newState.AnchorServerTime, timeline)
 	end
 
 	-- Time may have jumped; resume event detection from the new hour without firing.
 	lastRevision = newState.Revision
 	clockState = newState
 	previousHour = currentHour
+	previousServerTime = serverNow
 
+	applyClientTime(currentHour)
+	const phaseChange = commitPhase(currentHour)
 	ensureHeartbeat()
+
+	firePhaseChange(phaseChange)
+	if skippedFromHour ~= nil then
+		TimeEvents.forEachCrossed(timeEvents, skippedFromHour, currentHour, fireTimeEvent)
+	end
 end
 
 local function startServer()
@@ -275,7 +370,8 @@ local function startServer()
 		then Config.StartTimeOfDay
 		else Lighting:GetMinutesAfterMidnight() / MINUTES_PER_HOUR
 	const dayLengthSeconds = Config.DayLengthInMinutes * SECONDS_PER_MINUTE
-	const newState = Clock.create(startHour, Config.StartDay, dayLengthSeconds, getServerTime())
+	const serverTime = getServerTime()
+	const newState = Clock.create(startHour, Config.StartDay, dayLengthSeconds, serverTime)
 
 	for eventName, eventHour in timeEvents do
 		Replication.publishTimeEvent(script, eventName, eventHour)
@@ -284,8 +380,10 @@ local function startServer()
 	const publishedState = Replication.publishClockState(script, newState)
 	clockState = publishedState
 	previousHour = publishedState.AnchorHour
+	previousServerTime = serverTime
 
-	updatePhase(publishedState.AnchorHour)
+	publishDay(publishedState.AnchorDay)
+	commitPhase(publishedState.AnchorHour)
 	Replication.publishIsPaused(false)
 	ensureHeartbeat()
 
@@ -452,6 +550,26 @@ function DayNightCycle.SetTime(hour: number, fireSkippedEvents: boolean?)
 
 	reanchorClock({ Hour = hour, FireSkippedEvents = fireSkippedEvents })
 	logger:debug(`Day/Night cycle time set to {string.format("%.2f", hour)}h.`)
+end
+
+--[[
+	[Public Method] [Server only]
+	Sets the day number, keeping the current time. Useful for restoring a saved day count when
+	the server starts, or resetting it between rounds. Time events do not fire.
+	@param day The new day number, a whole number.
+]]
+function DayNightCycle.SetDay(day: number)
+	if not requireServer("SetDay") then
+		return
+	end
+
+	assert(
+		typeof(day) == "number" and day == math.floor(day) and math.abs(day) < math.huge,
+		"day must be a whole number"
+	)
+
+	reanchorClock({ Day = day })
+	logger:debug(`Day/Night cycle day set to {day}.`)
 end
 
 --[[
