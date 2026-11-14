@@ -193,5 +193,61 @@ Harness.test("variable speed: jumping to a phase start lands exactly in that pha
 	Harness.expectEqual(Timeline.getPhase(VARIABLE, hour), "Day")
 end)
 
+Harness.test("reanchor sets the day without changing the time", function()
+	const state = Clock.create(6, 3, DAY_LENGTH_SECONDS, 1000)
+	const changed = reanchor(state, 1000 + SECONDS_PER_GAME_HOUR, { Day = 40 })
+	const hour, day = getTime(changed, 1000 + SECONDS_PER_GAME_HOUR)
+
+	Harness.expectNear(hour, 7)
+	Harness.expectEqual(day, 40)
+end)
+
+Harness.test("reanchor keeps counting days from a day it was set to", function()
+	const state = Clock.create(23, 3, DAY_LENGTH_SECONDS, 0)
+	const changed = reanchor(state, 0, { Day = 40 })
+	const _hour, day = getTime(changed, 2 * SECONDS_PER_GAME_HOUR)
+
+	Harness.expectEqual(day, 41)
+end)
+
+Harness.test("getEventStartHour keeps the previous hour for a normal step", function()
+	const state = Clock.create(6, 1, DAY_LENGTH_SECONDS, 1000)
+	const fromHour = Clock.getEventStartHour(state, UNIFORM, 6.0001, 1000.5, 1000.52, 30)
+
+	Harness.expectEqual(fromHour, 6.0001)
+end)
+
+Harness.test("getEventStartHour keeps the previous hour for a step within the window", function()
+	const state = Clock.create(6, 1, DAY_LENGTH_SECONDS, 1000)
+	const fromHour = Clock.getEventStartHour(state, UNIFORM, 6.1, 1045, 1075, 30)
+
+	Harness.expectEqual(fromHour, 6.1)
+end)
+
+Harness.test("getEventStartHour only reaches back one window after a stall", function()
+	const state = Clock.create(6, 1, DAY_LENGTH_SECONDS, 1000)
+	-- The previous step was 1000 seconds ago; only the last 30 seconds are recent.
+	const fromHour = Clock.getEventStartHour(state, UNIFORM, 6.0, 1000, 2000, 30)
+
+	Harness.expectNear(fromHour, 6 + (2000 - 30 - 1000) / SECONDS_PER_GAME_HOUR)
+end)
+
+Harness.test("getEventStartHour follows the variable speed of the timeline", function()
+	const state = Clock.create(6, 1, 1000, 0)
+	const fromHour = Clock.getEventStartHour(state, VARIABLE, 6, 0, 500, 100)
+
+	-- 400 seconds in is position 0.125 + 0.4 = 0.525. Day spans 0.125 to 0.875 for its 12
+	-- hours, so that is 6 + 0.4 / 0.75 * 12 = 12.4.
+	Harness.expectNear(fromHour, 12.4)
+end)
+
+Harness.test("getEventStartHour never reaches back more than half a day", function()
+	const state = Clock.create(0, 1, 100, 0)
+	const fromHour = Clock.getEventStartHour(state, UNIFORM, 0, 0, 90, 80)
+
+	-- The window is limited to 50 seconds (half of the day), so 40 seconds in is hour 9.6.
+	Harness.expectNear(fromHour, 9.6)
+end)
+
 -- Modules must return a value; the tests register themselves with the harness on require.
 return true

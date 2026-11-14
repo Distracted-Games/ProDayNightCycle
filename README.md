@@ -10,7 +10,7 @@ The server owns the clock and replicates it with attributes. Every machine deriv
 - **Time events**: Fire named events at specific in-game hours (e.g. "Dawn", "Midnight") on both the Server and the Clients. Add and remove them at runtime.
 - **Phases with variable speed**: Divide the day into phases (Night, Dawn, Day, Dusk by default) and give each a `TimeShare` that sets how fast it passes.
 - **Lighting looks**: Each phase can set properties on `Lighting`, `Atmosphere`, `BloomEffect`, `SunRaysEffect` and `ColorCorrectionEffect`. The lighting blends between looks as the day moves through the phases.
-- **Runtime control**: Pause, resume, jump to a time, and change the day length from the Server.
+- **Runtime control**: Pause, resume, jump to a time, set the day number, and change the day length from the Server.
 - **HUD-friendly attributes**: `Day`, `IsPaused` and `Phase` are published as attributes on `Lighting`.
 - **Lifecycle ready**: Works with the [ModuleLoader](https://github.com/Distracted-Games/ModuleLoader) framework.
 - **Integrated logging**: Uses the included [Logger](https://github.com/Distracted-Games/Logger) utility for toggleable debug output.
@@ -143,6 +143,10 @@ DayNightCycle.PhaseChanged:Connect(function(newPhase: string, previousPhase: str
 end)
 ```
 
+By the time a listener runs, the clock, `GetPhase()`, `GetDay()` and the attributes on `Lighting` are all up to date. When one frame brings both a phase change and time events, `PhaseChanged` fires first. Listeners on the Server may call `SetTime`, `Pause`, `SetDay` and the other control functions; the new state is kept.
+
+Events are detected from the clock, so they fire the same way on every machine. If a Client stalls (for example a phone app in the background), events from before the last 30 seconds are skipped rather than replayed all at once.
+
 ### Adding Time Events at Runtime
 From the Server, events replicate to all Clients automatically.
 
@@ -157,7 +161,10 @@ DayNightCycle.Resume()
 DayNightCycle.SetTime(5.7) -- Jump to 5:42 AM on the current day, silently.
 DayNightCycle.SetTime(5.7, true) -- Same, but fire the events passed on the way.
 DayNightCycle.SetDayLength(30) -- A day now lasts 30 real-world minutes.
+DayNightCycle.SetDay(12) -- Restore a saved day count. The time of day is unchanged.
 ```
+
+Calls made in the same frame replicate as one update, so a `SetTime(hour, true)` followed by `Pause()` in that frame still fires its skipped events on Clients. Avoid chaining several `SetTime(hour, true)` calls in one frame; Clients fire the events of the final jump only.
 
 ### Reading Public State (HUDs)
 `Day`, `IsPaused` and `Phase` are attributes on `Lighting`, so a HUD can read them without requiring the module. Use `DayNightCycle.AttributeNames` for the names:
@@ -183,6 +190,7 @@ Server-only functions called from a Client log a warning and do nothing.
 | `Pause()` | **[Server]** Freezes game time. Events do not fire while paused. |
 | `Resume()` | **[Server]** Resumes game time where it paused. |
 | `SetTime(hour, fireSkippedEvents?)` | **[Server]** Jumps to an hour on the current day. `Day` is unchanged. Events passed on the way fire in order only if `fireSkippedEvents` is true. |
+| `SetDay(day)` | **[Server]** Sets the day number (a whole number), keeping the time. No events fire. Useful for restoring a saved day count. |
 | `SetDayLength(minutes)` | **[Server]** Changes the real-world minutes per game day, keeping the current time. |
 | `GetCurrentTime(): number` | The current in-game time (0-24). |
 | `GetDay(): number` | The current day number. It increases each midnight. |
@@ -202,7 +210,7 @@ Server-only functions called from a Client log a warning and do nothing.
 - **Clients must call `Start()`.** They no longer start from a Server broadcast.
 - The RemoteEvents are gone. State replicates with attributes, and a Client can no longer request a sync.
 - Time events fire from the clock instead of per-event flags, and event names are limited to letters, numbers and underscores.
-- New: phases, lighting looks, `Pause`, `Resume`, `SetTime`, `SetDayLength`, `GetDay`, `GetPhase`, `IsPaused` and `PhaseChanged`.
+- New: phases, lighting looks, `Pause`, `Resume`, `SetTime`, `SetDay`, `SetDayLength`, `GetDay`, `GetPhase`, `IsPaused` and `PhaseChanged`.
 
 ## Performance Notes
 - The Server only replicates when the clock changes (start, pause, resume, `SetTime`, `SetDayLength`) or an event is added or removed. Time passing costs no network traffic.

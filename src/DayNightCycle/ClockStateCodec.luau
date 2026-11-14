@@ -22,7 +22,26 @@ const MAX_ENCODED_LENGTH = 50
 const PAUSED_FLAG = 1
 const FIRE_SKIPPED_EVENTS_FLAG = 2
 
+const HOURS_PER_DAY = 24
+const HOUR_FORMAT = "%.5f"
+
 const ClockStateCodec = {}
+
+--[[
+	Rounds the anchor hour the way it is encoded. An hour that rounds up to a full day is the
+	start of the next day, so it becomes hour 0 of the following day instead of losing the day.
+	@return The rounded anchor hour (0 up to but not including 24) and the anchor day.
+]]
+local function roundAnchor(anchorHour: number, anchorDay: number): (number, number)
+	const roundedHour = tonumber(string.format(HOUR_FORMAT, anchorHour))
+	assert(roundedHour, "The anchor hour must be a number.")
+
+	if roundedHour >= HOURS_PER_DAY then
+		return 0, anchorDay + 1
+	end
+
+	return roundedHour, anchorDay
+end
 
 --[[
 	Encodes a clock state. Numbers are rounded (milliseconds for the anchor time), so use
@@ -31,13 +50,14 @@ const ClockStateCodec = {}
 function ClockStateCodec.encode(state: Types.ClockState): string
 	const flags = (if state.Paused then PAUSED_FLAG else 0)
 		+ (if state.FireSkippedEvents then FIRE_SKIPPED_EVENTS_FLAG else 0)
+	const anchorHour, anchorDay = roundAnchor(state.AnchorHour, state.AnchorDay)
 
 	const encoded = string.format(
-		"%d|%.3f|%.5f|%.10g|%.10g|%d",
+		"%d|%.3f|" .. HOUR_FORMAT .. "|%.10g|%.10g|%d",
 		state.Revision,
 		state.AnchorServerTime,
-		state.AnchorHour,
-		state.AnchorDay,
+		anchorHour,
+		anchorDay,
 		state.DayLengthSeconds,
 		flags
 	)

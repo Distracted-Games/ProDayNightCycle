@@ -18,12 +18,14 @@ const HOURS_PER_DAY = 24
 	Describes what should change when the clock is re-anchored. Anything left nil is
 	carried over from the current state.
 	- Hour: Jump to this game hour (0-24) on the current day.
+- Day: Set the day number.
 	- DayLengthSeconds: Use a new real-world day length.
 	- Paused: Freeze or unfreeze game time.
 	- FireSkippedEvents: Marks the anchor as one whose skipped events should fire.
 ]]
 export type Changes = {
 	Hour: number?,
+	Day: number?,
 	DayLengthSeconds: number?,
 	Paused: boolean?,
 	FireSkippedEvents: boolean?,
@@ -80,6 +82,36 @@ function Clock.getTime(
 end
 
 --[[
+	Limits how far back event detection reaches after a stall. Events are detected from the
+	hour at the previous step to the current hour; if the previous step was long ago (a
+	backgrounded app, a loading hitch), only events from the last `windowSeconds` are still
+	recent enough to fire, and the older ones are skipped.
+	@param state The clock state that was running at the previous step.
+	@param previousHour The game hour at the previous step.
+	@param previousServerTime The server time of the previous step.
+	@param serverNow The current server time in seconds.
+	@param windowSeconds How many real-world seconds back events may still fire.
+	@return The hour to detect events from.
+]]
+function Clock.getEventStartHour(
+	state: Types.ClockState,
+	timeline: Timeline.Timeline,
+	previousHour: number,
+	previousServerTime: number,
+	serverNow: number,
+	windowSeconds: number
+): number
+	-- Never reach back over half a day, where "forward" and "backward" cannot be told apart.
+	const reachSeconds = math.min(windowSeconds, state.DayLengthSeconds / 2)
+	if serverNow - previousServerTime <= reachSeconds then
+		return previousHour
+	end
+
+	const startHour = Clock.getTime(state, serverNow - reachSeconds, timeline)
+	return startHour
+end
+
+--[[
 	Creates a new clock state anchored at the current moment, applying the given changes.
 	The game time does not jump unless `changes.Hour` is given.
 	@param state The current clock state.
@@ -99,7 +131,7 @@ function Clock.reanchor(
 		Revision = state.Revision + 1,
 		AnchorServerTime = serverNow,
 		AnchorHour = (if changes.Hour then changes.Hour else currentHour) % HOURS_PER_DAY,
-		AnchorDay = currentDay,
+		AnchorDay = if changes.Day then changes.Day else currentDay,
 		DayLengthSeconds = if changes.DayLengthSeconds
 			then changes.DayLengthSeconds
 			else state.DayLengthSeconds,
